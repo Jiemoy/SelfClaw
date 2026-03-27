@@ -1,0 +1,78 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Default capabilities",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "core:window:default",
+    "core:window:allow-start-dragging",
+    "core:window:allow-minimize",
+    "core:window:allow-toggle-maximize",
+    "core:window:allow-close",
+    "core:webview:default",
+    "dialog:allow-open",
+    "dialog:allow-save",
+    "dialog:allow-confirm",
+    "dialog:allow-message",
+    "dialog:allow-ask",
+    {
+      "identifier": "fs:allow-read",
+      "allow": [
+        { "path": "$APPDATA/**" },
+        { "path": "$LOCALAPPDATA/**" },
+        { "path": "$HOME/.openclaw/**" },
+        { "path": "$HOME/OpenClaw/**" }
+      ]
+    },
+    {
+      "identifier": "fs:allow-write",
+      "allow": [
+        { "path": "$APPDATA/**" },
+        { "path": "$LOCALAPPDATA/**" },
+        { "path": "$HOME/.openclaw/**" },
+        { "path": "$HOME/OpenClaw/**" },
+        { "path": "$DESKTOP/**" },
+        { "path": "$DOCUMENT/**" },
+        { "path": "$DOWNLOAD/**" }
+      ]
+    },
+    {
+      "identifier": "fs:allow-read-dir",
+      "allow": [
+        { "path": "$APPDATA/**" },
+        { "path": "$LOCALAPPDATA/**" },
+        { "path": "$HOME/.openclaw/**" },
+        { "path": "$HOME/OpenClaw/**" }
+      ]
+    },
+    {
+      "identifier": "fs:allow-stat",
+      "allow": [
+        { "path": "$APPDATA/**" },
+        { "path": "$LOCALAPPDATA/**" },
+        { "path": "$HOME/.openclaw/**" },
+        { "path": "$HOME/OpenClaw/**" }
+      ]
+    },
+    {
+      "identifier": "shell:allow-execute",
+      "allow": [
+        { "cmd": "openclaw", "args": true, "name": "run-openclaw" },
+        { "cmd": "node", "args": true, "name": "run-node" },
+        { "cmd": "npm", "args": true, "name": "run-npm" },
+        { "cmd": "npx", "args": true, "name": "run-npx" }
+      ]
+    },
+    "shell:allow-open",
+    {
+      "identifier": "http:default",
+      "allow": [
+        { "url": "http://127.0.0.1:18789/*" },
+        { "url": "http://localhost:18789/*" },
+        { "url": "https://**" },
+        { "url": "http://**" }
+      ]
+    }
+  ]
+}
