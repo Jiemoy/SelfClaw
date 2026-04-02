@@ -1,4 +1,4 @@
-﻿#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -11,7 +11,6 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tauri::async_runtime::spawn_blocking;
 use tauri::menu::MenuBuilder;
 use tauri::tray::{TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Emitter, Manager, Runtime, State, WindowEvent};
@@ -24,7 +23,8 @@ const MAIN_WINDOW_LABEL: &str = "main";
 const TRAY_MENU_TOGGLE: &str = "tray_toggle_main";
 const TRAY_MENU_RESTART_GATEWAY: &str = "tray_restart_gateway";
 const TRAY_MENU_QUIT: &str = "tray_quit_app";
-const COMMAND_TIMEOUT_SECONDS: u64 = 10;
+const COMMAND_TIMEOUT_SECONDS: u64 = 30;
+const NPM_GLOBAL_INSTALL_TIMEOUT_SECONDS: u64 = 900;
 const DOCTOR_TIMEOUT_SECONDS: u64 = 45;
 const PRE_START_STOP_TIMEOUT_SECONDS: u64 = 8;
 #[cfg(target_os = "windows")]
@@ -145,6 +145,7 @@ struct OpenClawConfigPayload {
     http_proxy: Option<String>,
     socks5_proxy: Option<String>,
     gateway_port: Option<u16>,
+    gateway_token: Option<String>,
     log_level: Option<String>,
     history_message_limit: Option<u32>,
     long_term_memory_enabled: Option<bool>,
@@ -272,10 +273,10 @@ fn flatten_json_config(prefix: Option<&str>, value: &Value, out: &mut HashMap<St
 
 fn parse_json_config(path: &Path) -> Result<HashMap<String, String>, String> {
     let content = fs::read_to_string(path)
-        .map_err(|error| format!("鐠囪褰囬柊宥囩枂閺傚洣锟?{} 婢惰精锟? {}", path.display(), error))?;
+        .map_err(|error| format!("读取配置文件 {} 失败：{}", path.display(), error))?;
     let parsed: Value = serde_json::from_str(&content).map_err(|error| {
         format!(
-            "闁板秶鐤嗛弬鍥︽ {} JSON 鐟欙絾鐎芥径杈Е: {}",
+            "解析配置文件 {} JSON 格式错误：{}",
             path.display(),
             error
         )
@@ -288,7 +289,7 @@ fn parse_json_config(path: &Path) -> Result<HashMap<String, String>, String> {
 
 fn parse_text_config(path: &Path) -> Result<HashMap<String, String>, String> {
     let content = fs::read_to_string(path)
-        .map_err(|error| format!("鐠囪褰囬柊宥囩枂閺傚洣锟?{} 婢惰精锟? {}", path.display(), error))?;
+        .map_err(|error| format!("读取配置文件 {} 失败：{}", path.display(), error))?;
     let mut values = HashMap::new();
 
     for line in content.lines() {
@@ -333,26 +334,26 @@ fn read_selfclaw_ui_config_sync() -> Result<SelfClawUiConfig, String> {
     }
 
     let content = fs::read_to_string(&path)
-        .map_err(|error| format!("璇诲彇 UI 閰嶇疆 {} 澶辫触: {}", path.display(), error))?;
+        .map_err(|error| format!("读取 UI 配置 {} 失败：{}", path.display(), error))?;
     if content.trim().is_empty() {
         return Ok(SelfClawUiConfig::default());
     }
 
     serde_json::from_str::<SelfClawUiConfig>(&content)
-        .map_err(|error| format!("瑙ｆ瀽 UI 閰嶇疆 {} 澶辫触: {}", path.display(), error))
+        .map_err(|error| format!("解析 UI 配置 {} 失败：{}", path.display(), error))
 }
 
 fn write_selfclaw_ui_config_sync(config: &SelfClawUiConfig) -> Result<(), String> {
     let path = selfclaw_ui_config_path();
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
-            .map_err(|error| format!("鍒涘缓閰嶇疆鐩綍 {} 澶辫触: {}", parent.display(), error))?;
+            .map_err(|error| format!("创建配置目录 {} 失败：{}", parent.display(), error))?;
     }
 
     let content = serde_json::to_string_pretty(config)
-        .map_err(|error| format!("搴忓垪锟?UI 閰嶇疆澶辫触: {}", error))?;
+        .map_err(|error| format!("序列化 UI 配置失败：{}", error))?;
     fs::write(&path, content)
-        .map_err(|error| format!("鍐欏叆 UI 閰嶇疆 {} 澶辫触: {}", path.display(), error))
+        .map_err(|error| format!("写入 UI 配置 {} 失败：{}", path.display(), error))
 }
 
 fn normalize_option_string(value: Option<String>) -> Option<String> {
@@ -366,6 +367,7 @@ fn normalize_option_string(value: Option<String>) -> Option<String> {
     })
 }
 
+#[allow(dead_code)]
 fn run_openclaw_config_set_with_fallback(
     field_label: &str,
     key_candidates: &[&str],
@@ -387,7 +389,7 @@ fn run_openclaw_config_set_with_fallback(
     }
 
     Err(format!(
-        "{} 鍐欏叆澶辫触锛堝皾璇曢敭: {}锟? {}",
+        "{} 写入失败（尝试键：{}）：{}",
         field_label,
         key_candidates.join(", "),
         errors.join(" | ")
@@ -397,9 +399,9 @@ fn run_openclaw_config_set_with_fallback(
 fn update_openclaw_config_sync(payload: OpenClawConfigPayload) -> Result<String, String> {
     let workspace_dir = openclaw_workspace_dir();
     fs::create_dir_all(&workspace_dir)
-        .map_err(|error| format!("鍒涘缓閰嶇疆鐩綍 {} 澶辫触: {}", workspace_dir.display(), error))?;
+        .map_err(|error| format!("创建配置目录 {} 失败：{}", workspace_dir.display(), error))?;
 
-    // 1) SelfClaw 澹冲瓙閰嶇疆鐗╃悊闅旂鍐欏叆 ~/.openclaw/selfclaw-ui.json
+    // 1) SelfClaw UI 偏好写入 ~/.openclaw/selfclaw-ui.json
     let mut ui_config = read_selfclaw_ui_config_sync()?;
     if payload.custom_name.is_some() {
         ui_config.custom_name = normalize_option_string(payload.custom_name.clone());
@@ -418,90 +420,150 @@ fn update_openclaw_config_sync(payload: OpenClawConfigPayload) -> Result<String,
     }
     write_selfclaw_ui_config_sync(&ui_config)?;
 
-    // 2) 搴曞眰 OpenClaw 閰嶇疆缁熶竴锟?CLI锛岄伩鍏嶇洿鎺ュ啓锟?openclaw.json Schema
-    let mut errors: Vec<String> = Vec::new();
-    let mut apply_setting = |field_label: &str, candidates: &[&str], value: Option<String>| {
-        if let Some(raw) = value {
-            if let Err(error) = run_openclaw_config_set_with_fallback(field_label, candidates, &raw)
-            {
-                errors.push(error);
-            }
-        }
+    // 2) OpenClaw 底层配置直接写入 ~/.openclaw/openclaw.json
+    let config_path = workspace_dir.join("openclaw.json");
+    let mut config: Value = if config_path.exists() {
+        let content = fs::read_to_string(&config_path)
+            .map_err(|error| format!("读取配置文件 {} 失败：{}", config_path.display(), error))?;
+        serde_json::from_str(&content)
+            .unwrap_or_else(|_| Value::Object(serde_json::Map::new()))
+    } else {
+        Value::Object(serde_json::Map::new())
     };
 
-    apply_setting(
-        "Provider",
-        &["llm.provider", "provider"],
-        normalize_option_string(payload.provider),
-    );
-    apply_setting(
-        "Model",
-        &["llm.model", "model"],
-        normalize_option_string(payload.model),
-    );
-    apply_setting(
-        "Default Model",
-        &["llm.default_model", "default_model"],
-        normalize_option_string(payload.default_model),
-    );
-    apply_setting(
-        "API Key",
-        &["llm.api_key", "api_key"],
-        normalize_option_string(payload.api_key),
-    );
-    apply_setting(
-        "Base URL",
-        &["llm.base_url", "base_url"],
-        normalize_option_string(payload.base_url),
-    );
-    apply_setting(
-        "System Prompt",
-        &["llm.system_prompt", "system_prompt"],
-        normalize_option_string(payload.system_prompt),
-    );
-    apply_setting(
-        "Temperature",
-        &["llm.temperature", "temperature"],
-        payload.temperature.map(|value| value.to_string()),
-    );
-    apply_setting(
-        "Max Tokens",
-        &["llm.max_tokens", "max_tokens"],
-        payload.max_tokens.map(|value| value.to_string()),
-    );
-    apply_setting(
-        "HTTP Proxy",
-        &["network.http_proxy", "http_proxy"],
-        normalize_option_string(payload.http_proxy),
-    );
-    apply_setting(
-        "SOCKS5 Proxy",
-        &["network.socks5_proxy", "socks5_proxy"],
-        normalize_option_string(payload.socks5_proxy),
-    );
-    apply_setting(
-        "Gateway Port",
-        &["gateway.port", "gateway_port"],
-        payload.gateway_port.map(|value| value.to_string()),
-    );
-    apply_setting(
-        "Log Level",
-        &["log.level", "log_level"],
-        normalize_option_string(payload.log_level),
-    );
+    let obj = config.as_object_mut().unwrap();
 
-    if errors.is_empty() {
-        Ok(format!(
-            "锟斤拷锟斤拷锟斤拷同锟斤拷锟斤拷锟阶诧拷锟斤拷锟斤拷通锟斤拷 OpenClaw CLI 锟斤拷锟铰ｏ拷SelfClaw UI 锟斤拷锟斤拷锟斤拷写锟斤拷 {}",
-            selfclaw_ui_config_path().display()
-        ))
-    } else {
-        Err(format!(
-            "锟斤拷锟矫憋拷锟芥部锟斤拷失锟杰ｏ拷{}锟斤拷SelfClaw UI 锟斤拷锟斤拷锟斤拷写锟斤拷 {}",
-            errors.join("锟斤拷"),
-            selfclaw_ui_config_path().display()
-        ))
+    // --- LLM section: obj["llm"] ---
+    {
+        let llm = obj
+            .entry("llm".to_string())
+            .or_insert_with(|| Value::Object(serde_json::Map::new()));
+        if let Some(llm_map) = llm.as_object_mut() {
+            if let Some(v) = normalize_option_string(payload.provider.clone()) {
+                llm_map.insert("provider".to_string(), Value::String(v));
+            } else {
+                llm_map.remove("provider");
+            }
+            let model_name = normalize_option_string(
+                payload
+                    .default_model
+                    .clone()
+                    .or_else(|| payload.model.clone()),
+            );
+            if let Some(v) = model_name {
+                llm_map.insert("model".to_string(), Value::String(v));
+            } else {
+                llm_map.remove("model");
+            }
+            if let Some(v) = normalize_option_string(payload.api_key.clone()) {
+                llm_map.insert("api_key".to_string(), Value::String(v));
+            } else {
+                llm_map.remove("api_key");
+            }
+            if let Some(v) = normalize_option_string(payload.base_url.clone()) {
+                llm_map.insert("base_url".to_string(), Value::String(v));
+            } else {
+                llm_map.remove("base_url");
+            }
+            if let Some(v) = normalize_option_string(payload.system_prompt.clone()) {
+                llm_map.insert("system_prompt".to_string(), Value::String(v));
+            } else {
+                llm_map.remove("system_prompt");
+            }
+            if let Some(v) = payload.temperature {
+                let num = serde_json::Number::from_f64(v)
+                    .unwrap_or_else(|| serde_json::Number::from(0));
+                llm_map.insert("temperature".to_string(), Value::Number(num));
+            } else {
+                llm_map.remove("temperature");
+            }
+            if let Some(v) = payload.max_tokens {
+                llm_map.insert(
+                    "max_tokens".to_string(),
+                    Value::Number(serde_json::Number::from(v)),
+                );
+            } else {
+                llm_map.remove("max_tokens");
+            }
+        }
     }
+
+    // --- Network section: obj["network"] ---
+    {
+        let network = obj
+            .entry("network".to_string())
+            .or_insert_with(|| Value::Object(serde_json::Map::new()));
+        if let Some(net_map) = network.as_object_mut() {
+            if let Some(v) = normalize_option_string(payload.http_proxy.clone()) {
+                net_map.insert("http_proxy".to_string(), Value::String(v));
+            } else {
+                net_map.remove("http_proxy");
+            }
+            if let Some(v) = normalize_option_string(payload.socks5_proxy.clone()) {
+                net_map.insert("socks5_proxy".to_string(), Value::String(v));
+            } else {
+                net_map.remove("socks5_proxy");
+            }
+        }
+    }
+
+    // --- Gateway section: obj["gateway"] ---
+    {
+        let gateway = obj
+            .entry("gateway".to_string())
+            .or_insert_with(|| Value::Object(serde_json::Map::new()));
+        if let Some(gw_map) = gateway.as_object_mut() {
+            if let Some(v) = payload.gateway_port {
+                gw_map.insert(
+                    "port".to_string(),
+                    Value::Number(serde_json::Number::from(u32::from(v))),
+                );
+            } else {
+                gw_map.remove("port");
+            }
+            // Write gateway auth token under gateway.auth.token
+            if let Some(token) = normalize_option_string(payload.gateway_token.clone()) {
+                let auth = gw_map
+                    .entry("auth".to_string())
+                    .or_insert_with(|| Value::Object(serde_json::Map::new()));
+                if let Some(auth_map) = auth.as_object_mut() {
+                    auth_map.insert("token".to_string(), Value::String(token));
+                }
+            } else {
+                // Remove token only if it was explicitly cleared
+                if let Some(auth) = gw_map.get("auth").and_then(Value::as_object) {
+                    let mut new_auth = auth.clone();
+                    new_auth.remove("token");
+                    gw_map.insert("auth".to_string(), Value::Object(new_auth));
+                }
+            }
+        }
+    }
+
+    // --- Log section: obj["log"] ---
+    {
+        let log = obj
+            .entry("log".to_string())
+            .or_insert_with(|| Value::Object(serde_json::Map::new()));
+        if let Some(log_map) = log.as_object_mut() {
+            if let Some(v) = normalize_option_string(payload.log_level.clone()) {
+                log_map.insert("level".to_string(), Value::String(v));
+            } else {
+                log_map.remove("level");
+            }
+        }
+    }
+
+    let content = serde_json::to_string_pretty(&config)
+        .map_err(|error| format!("序列化配置失败：{}", error))?;
+    fs::write(&config_path, content)
+        .map_err(|error| format!("写入配置文件 {} 失败：{}", config_path.display(), error))?;
+
+    Ok(format!(
+        "配置已保存至 {} 和 {}",
+        config_path.display(),
+        selfclaw_ui_config_path().display()
+    ))
 }
 
 fn pick_first_key(values: &HashMap<String, String>, aliases: &[&str]) -> Option<String> {
@@ -739,7 +801,7 @@ fn detect_openclaw_config_sync() -> Result<DetectedOpenClawConfig, String> {
         best
     };
 
-    // 锟较诧拷 SelfClaw UI 锟斤拷锟矫ｏ拷锟斤拷前锟斤拷统一锟斤拷锟窖★拷
+    // 同时读取 SelfClaw UI 配置，前者优先统一来源
     if let Ok(ui_config) = read_selfclaw_ui_config_sync() {
         merged.custom_name = ui_config.custom_name;
         merged.history_message_limit = ui_config.history_message_limit;
@@ -787,7 +849,7 @@ fn query_autostart_enabled_sync() -> Result<bool, String> {
 
         match cmd.output() {
             Ok(output) => Ok(output.status.success()),
-            Err(error) => Err(format!("锟斤拷询锟斤拷锟斤拷锟阶刺э拷锟? {}", error)),
+            Err(error) => Err(format!("查询开机自启状态失败：{}", error)),
         }
     }
 
@@ -802,10 +864,10 @@ fn set_autostart_enabled_sync(enabled: bool) -> Result<bool, String> {
     {
         if enabled {
             let current_executable =
-                std::env::current_exe().map_err(|error| format!("锟斤拷取锟斤拷执锟斤拷路锟斤拷失锟斤拷: {}", error))?;
+                std::env::current_exe().map_err(|error| format!("获取当前可执行文件路径失败：{}", error))?;
             let executable = current_executable
                 .to_str()
-                .ok_or_else(|| "锟斤拷执锟斤拷路锟斤拷锟斤拷锟斤拷锟角凤拷 UTF-8 锟街凤拷".to_string())?;
+                .ok_or_else(|| "可执行文件路径包含非 UTF-8 字符".to_string())?;
             let quoted_path = format!("\"{}\"", executable);
 
             let mut cmd = Command::new("reg");
@@ -836,7 +898,7 @@ fn set_autostart_enabled_sync(enabled: bool) -> Result<bool, String> {
                     };
                     Err(message)
                 }
-                Err(error) => Err(format!("锟斤拷锟斤拷锟斤拷锟斤拷锟绞э拷锟? {}", error)),
+                Err(error) => Err(format!("写入注册表失败：{}", error)),
             }
         } else {
             let mut cmd = Command::new("reg");
@@ -1001,7 +1063,7 @@ async fn run_command_output_with_timeout(
 
     let mut child = cmd
         .spawn()
-        .map_err(|error| format!("鍚姩鍛戒护 `{}` 澶辫触: {}", command, error))?;
+        .map_err(|error| format!("启动命令 {} 失败: {}", command, error))?;
 
     let stdout_task = child.stdout.take().map(|mut stdout| {
         tauri::async_runtime::spawn(async move {
@@ -1022,7 +1084,7 @@ async fn run_command_output_with_timeout(
     let status =
         match tokio::time::timeout(Duration::from_secs(timeout_seconds), child.wait()).await {
             Ok(wait_result) => wait_result
-                .map_err(|error| format!("绛夊緟鍛戒护 `{}` 瀹屾垚澶辫触: {}", command, error))?,
+        .map_err(|error| format!("等待命令 {} 完成失败：{}", command, error))?,
             Err(_) => {
                 let _ = child.kill().await;
                 let _ = child.wait().await;
@@ -1060,7 +1122,7 @@ async fn run_command_output_with_timeout(
         } else if !stdout.is_empty() {
             stdout
         } else {
-            format!("鍛戒护 `{}` 鎵ц澶辫触锛岄€€鍑虹爜: {}", command, status)
+        format!("命令 {} 执行失败，退出码：{}", command, status)
         };
         Err(message)
     }
@@ -1121,7 +1183,7 @@ fn spawn_gateway_output_reader<R>(
     app: AppHandle,
     stream: R,
     stderr: bool,
-    gateway_child: Option<Arc<Mutex<Option<Child>>>>,
+    _gateway_child: Option<Arc<Mutex<Option<Child>>>>,
 )
 where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
@@ -1149,37 +1211,11 @@ where
                 }
             }
         }
-
-        if stderr {
-            return;
-        }
-
-        let Some(gateway_child) = gateway_child else {
-            return;
-        };
-
-        let Some(mut child) = ({
-            let mut guard = gateway_child.lock().await;
-            guard.take()
-        }) else {
-            return;
-        };
-
-        let wait_result = child.wait().await;
-
-        match wait_result {
-            Ok(status) => {
-                emit_gateway_log_line(&app, format!("[system] Gateway process exited: {}", status));
-                let _ = app.emit("gateway-exited", ());
-            }
-            Err(error) => {
-                emit_gateway_log_line(
-                    &app,
-                    format!("[error] Failed waiting for gateway process exit: {}", error),
-                );
-                let _ = app.emit("gateway-exited", ());
-            }
-        }
+        // NOTE: do NOT call child.wait() here — it causes deadlock because:
+        //   - we hold the stdout reader which the child is writing to
+        //   - the child (cmd /c openclaw gateway) only exits when openclaw exits
+        //   - openclaw gateway runs forever, so we would wait forever
+        // Gateway process lifecycle is managed separately via GatewayProcessState.
     });
 }
 async fn start_openclaw_gateway_process(
@@ -1192,14 +1228,14 @@ async fn start_openclaw_gateway_process(
         if let Some(existing_child) = guard.as_mut() {
             match existing_child.try_wait() {
                 Ok(Some(status)) => {
-                    emit_gateway_log_line(&app, format!("[system] 锟斤拷獾斤拷锟斤拷锟斤拷亟锟斤拷锟斤拷锟斤拷顺锟? {}", status));
+                    emit_gateway_log_line(&app, format!("[system] 检测到网关进程已退出，状态：{}", status));
                     *guard = None;
                 }
-                Ok(None) => return Ok("锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷".to_string()),
+                Ok(None) => return Ok("网关已在运行中".to_string()),
                 Err(error) => {
                     emit_gateway_log_line(
                         &app,
-                        format!("[warn] 锟斤拷锟斤拷锟截斤拷锟斤拷状态锟斤拷锟绞э拷埽锟斤拷锟斤拷锟斤拷镁锟斤拷: {}", error),
+                        format!("[warn] 检查现有网关进程状态失败，将重新启动：{}", error),
                     );
                     *guard = None;
                 }
@@ -1227,7 +1263,9 @@ async fn start_openclaw_gateway_process(
         ));
     }
 
-    let args = vec!["gateway".to_string()];
+    let args = vec!["gateway".to_string(), "--allow-unconfigured".to_string()];
+    // Windows: npm 全局安装的是 openclaw.cmd，CreateProcess 无法用 "openclaw" 直接解析；
+    // 必须经过 cmd 才能按 PATHEXT 找到 .cmd（与之前 shell 包装行为一致）。
     let mut cmd = build_shell_wrapped_tokio_command("openclaw", &args);
     attach_windows_flags_tokio(&mut cmd);
     cmd.stdout(Stdio::piped());
@@ -1235,7 +1273,7 @@ async fn start_openclaw_gateway_process(
 
     let mut child = cmd
         .spawn()
-        .map_err(|error| format!("锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟绞э拷锟? {}", error))?;
+        .map_err(|error| format!("启动网关进程失败：{}", error))?;
 
     let pid = child.id();
     let stdout = child.stdout.take();
@@ -1247,14 +1285,46 @@ async fn start_openclaw_gateway_process(
     }
 
     if let Some(stdout_stream) = stdout {
-        spawn_gateway_output_reader(app.clone(), stdout_stream, false, Some(gateway_child.clone()));
+        spawn_gateway_output_reader(app.clone(), stdout_stream, false, None);
     }
     if let Some(stderr_stream) = stderr {
         spawn_gateway_output_reader(app.clone(), stderr_stream, true, None);
     }
 
+    // 独立的 child 退出监控：只负责观察退出并发出 gateway-exited，不从共享状态中夺走 child
+    // 的拥有权，以便 stop_openclaw_gateway_process 仍能通过 taskkill 终止进程。
+    tokio::spawn({
+        let app = app.clone();
+        let gateway_child = gateway_child.clone();
+        async move {
+            loop {
+                // 每隔 1 秒检查一次 child 是否已退出，避免永久阻塞导致死锁。
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                let mut guard = gateway_child.lock().await;
+                let Some(child) = guard.as_mut() else {
+                    break;
+                };
+                match child.try_wait() {
+                    Ok(Some(status)) => {
+                        emit_gateway_log_line(&app, format!("[system] Gateway process exited: {}", status));
+                        let _ = app.emit("gateway-exited", ());
+                        break;
+                    }
+                    Ok(None) => {
+                        // 仍在运行，继续循环等待。
+                    }
+                    Err(e) => {
+                        emit_gateway_log_line(&app, format!("[error] Failed polling gateway process: {}", e));
+                        let _ = app.emit("gateway-exited", ());
+                        break;
+                    }
+                }
+            }
+        }
+    });
+
     if let Some(pid) = pid {
-        Ok(format!("锟斤拷锟斤拷前台锟斤拷锟斤拷锟斤拷锟斤拷锟?(PID: {})", pid))
+        Ok(format!("网关已在前台启动（PID: {}）", pid))
     } else {
         Ok("OpenClaw gateway started in foreground".to_string())
     }
@@ -1263,76 +1333,109 @@ async fn start_openclaw_gateway_process(
 async fn stop_openclaw_gateway_process(
     gateway_child: Arc<Mutex<Option<Child>>>,
 ) -> Result<String, String> {
-    let maybe_child = { gateway_child.lock().await.take() };
-    if let Some(mut child) = maybe_child {
-        if let Some(pid) = child.id() {
-            #[cfg(target_os = "windows")]
-            {
-                let mut taskkill = tokio::process::Command::new("taskkill");
-                attach_windows_flags_tokio(&mut taskkill);
-                taskkill
-                    .arg("/F")
-                    .arg("/T")
-                    .arg("/PID")
-                    .arg(pid.to_string());
-                let _ = run_raw_tokio_command_with_timeout(taskkill, 10, "taskkill").await;
-            }
-
-            #[cfg(not(target_os = "windows"))]
-            {
-                let _ = child.kill().await;
-            }
+    // Take child OUT of shared state FIRST so snapshot_gateway_process can't
+    // return (true, pid) after we start killing — it will see None and check port.
+    let child_pid = {
+        let mut guard = gateway_child.lock().await;
+        if let Some(ref mut child) = *guard {
+            child.id()
         } else {
-            let _ = child.kill().await;
+            None
+        }
+    };
+
+    // Try graceful stop via openclaw CLI first
+    let _ = run_openclaw_cli_with_timeout_async(&["gateway", "stop"], 5).await;
+
+    // Force kill the process by PID
+    if let Some(pid) = child_pid {
+        #[cfg(target_os = "windows")]
+        {
+            let mut taskkill = tokio::process::Command::new("taskkill");
+            attach_windows_flags_tokio(&mut taskkill);
+            taskkill
+                .arg("/F")
+                .arg("/T")
+                .arg("/PID")
+                .arg(pid.to_string());
+            let _ = run_raw_tokio_command_with_timeout(taskkill, 10, "taskkill").await;
         }
 
-        let _ = tokio::time::timeout(Duration::from_secs(3), child.wait()).await;
+        #[cfg(not(target_os = "windows"))]
+        {
+            let mut cmd = tokio::process::Command::new("kill");
+            cmd.arg("-9").arg(pid.to_string());
+            let _ = run_raw_tokio_command_with_timeout(cmd, 10, "kill").await;
+        }
     }
 
+    // Now clear the shared child state (safe — we own nothing now)
+    {
+        let mut guard = gateway_child.lock().await;
+        *guard = None;
+    }
+
+    // Kill any remaining processes on the gateway port
     kill_gateway_port_occupants().await;
 
-    for _ in 0..10 {
+    // Poll port until it is confirmed free (up to 6 seconds)
+    for _ in 0..60 {
         if !is_port_open(GATEWAY_PORT) {
             return Ok("Gateway stopped".to_string());
         }
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
-    Err(format!(
-        "Gateway port {} is still occupied after stop",
-        GATEWAY_PORT
-    ))
+    // Port still occupied after 6s — try one more forceful cleanup
+    kill_gateway_port_occupants().await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    if !is_port_open(GATEWAY_PORT) {
+        Ok("Gateway stopped".to_string())
+    } else {
+        Err(format!(
+            "Gateway port {} is still occupied after stop. Please manually stop the process using that port.",
+            GATEWAY_PORT
+        ))
+    }
 }
 
 async fn restart_openclaw_gateway_process(
     app: AppHandle,
     gateway_child: Arc<Mutex<Option<Child>>>,
 ) -> Result<String, String> {
+    // Stop may return Err if already stopped (port free) — that's fine for restart
     if let Err(error) = stop_openclaw_gateway_process(gateway_child.clone()).await {
-        if error != "锟斤拷锟斤拷未锟斤拷锟斤拷" {
+        // "网关未运行" means port is free — expected for restart
+        if error != "Gateway stopped" && !error.contains("port") {
             return Err(error);
         }
     }
 
     start_openclaw_gateway_process(app, gateway_child).await?;
-    Ok("锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷".to_string())
+    Ok("网关重启完成".to_string())
 }
 
 async fn snapshot_gateway_process(gateway_child: Arc<Mutex<Option<Child>>>) -> (bool, Option<u32>) {
-    let mut guard = gateway_child.lock().await;
-    let Some(child) = guard.as_mut() else {
-        return (false, None);
-    };
+    {
+        let mut guard = gateway_child.lock().await;
+        let Some(child) = guard.as_mut() else {
+            let running = is_port_open(GATEWAY_PORT);
+            return (running, None);
+        };
 
-    match child.try_wait() {
-        Ok(Some(_)) => {
-            *guard = None;
-            (false, None)
-        }
-        Ok(None) => (true, child.id()),
-        Err(_) => {
-            *guard = None;
-            (false, None)
+        match child.try_wait() {
+            Ok(Some(_)) => {
+                *guard = None;
+                let running = is_port_open(GATEWAY_PORT);
+                return (running, None);
+            }
+            Ok(None) => return (true, child.id()),
+            Err(_) => {
+                *guard = None;
+                let running = is_port_open(GATEWAY_PORT);
+                return (running, None);
+            }
         }
     }
 }
@@ -1510,7 +1613,7 @@ fn get_installed_skills_sync() -> Result<Vec<InstalledSkill>, String> {
 fn toggle_skill_status_sync(name: &str, enabled: bool) -> Result<String, String> {
     let skill_name = name.trim();
     if skill_name.is_empty() {
-        return Err("锟斤拷锟斤拷锟斤拷锟狡诧拷锟斤拷为锟斤拷".to_string());
+        return Err("技能名称不能为空".to_string());
     }
 
     let action = if enabled { "enable" } else { "disable" };
@@ -1523,12 +1626,12 @@ fn toggle_skill_status_sync(name: &str, enabled: bool) -> Result<String, String>
 
     if output.trim().is_empty() {
         Ok(format!(
-            "锟斤拷锟斤拷 `{}` 锟斤拷{}",
+            "技能 `{}` 已{}",
             skill_name,
             if enabled {
-                "锟斤拷锟斤拷"
+                "启用"
             } else {
-                "锟斤拷锟斤拷"
+                "禁用"
             }
         ))
     } else {
@@ -1538,31 +1641,31 @@ fn toggle_skill_status_sync(name: &str, enabled: bool) -> Result<String, String>
 
 fn show_main_window<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
     let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL) else {
-        return Err("锟斤拷锟斤拷锟节诧拷锟斤拷锟斤拷".to_string());
+        return Err("找不到主窗口".to_string());
     };
 
     let _ = window.unminimize();
     window
         .show()
-        .map_err(|error| format!("锟斤拷示锟斤拷锟斤拷锟斤拷失锟斤拷: {}", error))?;
+        .map_err(|error| format!("显示窗口失败：{}", error))?;
     window
         .set_focus()
-        .map_err(|error| format!("锟桔斤拷锟斤拷锟斤拷锟斤拷失锟斤拷: {}", error))?;
+        .map_err(|error| format!("聚焦窗口失败：{}", error))?;
     Ok(())
 }
 
 fn toggle_main_window_visibility<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
     let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL) else {
-        return Err("锟斤拷锟斤拷锟节诧拷锟斤拷锟斤拷".to_string());
+        return Err("找不到主窗口".to_string());
     };
 
     if window
         .is_visible()
-        .map_err(|error| format!("锟斤拷取锟斤拷锟节可硷拷状态失锟斤拷: {}", error))?
+        .map_err(|error| format!("获取窗口可见状态失败：{}", error))?
     {
         window
             .hide()
-            .map_err(|error| format!("锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷失锟斤拷: {}", error))?;
+            .map_err(|error| format!("隐藏窗口失败：{}", error))?;
     } else {
         show_main_window(app)?;
     }
@@ -1578,9 +1681,9 @@ fn graceful_shutdown_gateway_sync() {
 fn setup_system_tray(app: &AppHandle) -> tauri::Result<()> {
     let tray_menu = MenuBuilder::new(app)
         .text(TRAY_MENU_TOGGLE, "Show/Hide Window")
-        .text(TRAY_MENU_RESTART_GATEWAY, "锟斤拷锟斤拷锟斤拷锟斤拷")
+        .text(TRAY_MENU_RESTART_GATEWAY, "重启网关")
         .separator()
-        .text(TRAY_MENU_QUIT, "锟剿筹拷 SelfClaw")
+        .text(TRAY_MENU_QUIT, "退出 SelfClaw")
         .build()?;
 
     let mut tray_builder = TrayIconBuilder::with_id("selfclaw-tray")
@@ -1642,9 +1745,12 @@ where
     T: Send + 'static,
     F: FnOnce() -> Result<T, String> + Send + 'static,
 {
-    spawn_blocking(task)
-        .await
-        .map_err(|error| format!("閸氬骸褰存禒璇插閹笛嗩攽婢惰精锟? {}", error))?
+    let handle = tokio::task::spawn_blocking(task);
+    match tokio::time::timeout(Duration::from_secs(120), handle).await {
+        Ok(Ok(task_result)) => task_result,
+        Ok(Err(panic_error)) => Err(format!("后台任务 panic：{}", panic_error)),
+        Err(_) => Err("后台任务执行超时（120s）".to_string()),
+    }
 }
 
 fn is_port_open(port: u16) -> bool {
@@ -1658,12 +1764,12 @@ fn channel_templates() -> Vec<ImChannelEntry> {
     vec![
         ImChannelEntry {
             id: "feishu".to_string(),
-            name: Some("锟斤拷锟斤拷".to_string()),
+            name: Some("飞书".to_string()),
             ..Default::default()
         },
         ImChannelEntry {
             id: "wecom".to_string(),
-            name: Some("锟斤拷业微锟斤拷".to_string()),
+            name: Some("企业微信".to_string()),
             ..Default::default()
         },
         ImChannelEntry {
@@ -1676,8 +1782,8 @@ fn channel_templates() -> Vec<ImChannelEntry> {
 
 fn channel_name_by_id(channel_id: &str) -> String {
     match channel_id {
-        "feishu" => "锟斤拷锟斤拷".to_string(),
-        "wecom" => "锟斤拷业微锟斤拷".to_string(),
+        "feishu" => "飞书".to_string(),
+        "wecom" => "企业微信".to_string(),
         "qq" => "QQ".to_string(),
         _ => channel_id.to_string(),
     }
@@ -1748,10 +1854,10 @@ fn read_channels_from_disk() -> Result<Vec<ImChannelEntry>, String> {
     }
 
     let content = fs::read_to_string(&path)
-        .map_err(|error| format!("鐠囪褰囧〒鐘讳壕闁板秶锟?{} 婢惰精锟? {}", path.display(), error))?;
+        .map_err(|error| format!("读取渠道配置文件 {} 失败：{}", path.display(), error))?;
 
     let value: Value = serde_json::from_str(&content)
-        .map_err(|error| format!("濞撶娀浜鹃柊宥囩枂 JSON 閺嶇厧绱￠弮鐘虫櫏: {}", error))?;
+        .map_err(|error| format!("解析渠道配置文件 JSON 格式错误: {}", error))?;
 
     if let Some(array) = value.get("channels").and_then(Value::as_array) {
         let mut entries = Vec::new();
@@ -1814,7 +1920,7 @@ fn save_channels_to_disk(entries: &[ImChannelEntry]) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|error| {
             format!(
-                "閸戝棗顦〒鐘讳壕闁板秶鐤嗛惄顔肩秿 {} 婢惰精锟? {}",
+                "创建渠道配置目录 {} 失败：{}",
                 parent.display(),
                 error
             )
@@ -1826,10 +1932,10 @@ fn save_channels_to_disk(entries: &[ImChannelEntry]) -> Result<(), String> {
     };
 
     let data = serde_json::to_string_pretty(&payload)
-        .map_err(|error| format!("鎼村繐鍨崠鏍ㄧ闁捇鍘ょ純顔笺亼锟? {}", error))?;
+        .map_err(|error| format!("序列化渠道配置失败：{}", error))?;
 
     fs::write(&path, data)
-        .map_err(|error| format!("閸愭瑥鍙嗗〒鐘讳壕闁板秶锟?{} 婢惰精锟? {}", path.display(), error))
+        .map_err(|error| format!("写入渠道配置文件 {} 失败：{}", path.display(), error))
 }
 
 fn channel_is_configured(entry: &ImChannelEntry) -> bool {
@@ -1889,7 +1995,7 @@ fn upsert_channel(entries: &mut Vec<ImChannelEntry>, channel_id: &str) -> usize 
 async fn run_sys_command(command: String, args: Vec<String>) -> Result<String, String> {
     let normalized = command.trim().to_string();
     if normalized.is_empty() {
-        return Err("鍛戒护涓嶈兘涓虹┖".to_string());
+        return Err("命令不能为空".to_string());
     }
 
     run_in_background(move || run_command_output(&normalized, &args)).await
@@ -1947,7 +2053,7 @@ async fn plugins_list() -> Result<String, String> {
 #[tauri::command]
 async fn plugins_info(name: String) -> Result<String, String> {
     run_in_background(move || {
-        let plugin_name = ensure_cli_name(&name, "鎻掍欢鍚嶇О")?;
+        let plugin_name = ensure_cli_name(&name, "插件名称")?;
         let args = vec![
             "plugins".to_string(),
             "info".to_string(),
@@ -1961,7 +2067,7 @@ async fn plugins_info(name: String) -> Result<String, String> {
 #[tauri::command]
 async fn plugins_install(name: String) -> Result<String, String> {
     run_in_background(move || {
-        let plugin_name = ensure_cli_name(&name, "鎻掍欢鍚嶇О")?;
+        let plugin_name = ensure_cli_name(&name, "插件名称")?;
         let args = vec![
             "plugins".to_string(),
             "install".to_string(),
@@ -1975,7 +2081,7 @@ async fn plugins_install(name: String) -> Result<String, String> {
 #[tauri::command]
 async fn plugins_enable(name: String) -> Result<String, String> {
     run_in_background(move || {
-        let plugin_name = ensure_cli_name(&name, "鎻掍欢鍚嶇О")?;
+        let plugin_name = ensure_cli_name(&name, "插件名称")?;
         let args = vec![
             "plugins".to_string(),
             "enable".to_string(),
@@ -1989,7 +2095,7 @@ async fn plugins_enable(name: String) -> Result<String, String> {
 #[tauri::command]
 async fn plugins_disable(name: String) -> Result<String, String> {
     run_in_background(move || {
-        let plugin_name = ensure_cli_name(&name, "鎻掍欢鍚嶇О")?;
+        let plugin_name = ensure_cli_name(&name, "插件名称")?;
         let args = vec![
             "plugins".to_string(),
             "disable".to_string(),
@@ -2018,7 +2124,7 @@ async fn channels_status() -> Result<String, String> {
 #[tauri::command]
 async fn channels_logs(name: String) -> Result<String, String> {
     run_in_background(move || {
-        let channel_name = ensure_cli_name(&name, "娓犻亾鍚嶇О")?;
+        let channel_name = ensure_cli_name(&name, "渠道名称")?;
         let args = vec![
             "channels".to_string(),
             "logs".to_string(),
@@ -2032,7 +2138,7 @@ async fn channels_logs(name: String) -> Result<String, String> {
 #[tauri::command]
 async fn channels_add(name: String, args: Option<Vec<String>>) -> Result<String, String> {
     run_in_background(move || {
-        let channel_name = ensure_cli_name(&name, "娓犻亾鍚嶇О")?;
+        let channel_name = ensure_cli_name(&name, "渠道名称")?;
         let mut cmd_args = vec![
             "channels".to_string(),
             "add".to_string(),
@@ -2054,7 +2160,7 @@ async fn channels_add(name: String, args: Option<Vec<String>>) -> Result<String,
 #[tauri::command]
 async fn channels_remove(name: String) -> Result<String, String> {
     run_in_background(move || {
-        let channel_name = ensure_cli_name(&name, "娓犻亾鍚嶇О")?;
+        let channel_name = ensure_cli_name(&name, "渠道名称")?;
         let args = vec![
             "channels".to_string(),
             "remove".to_string(),
@@ -2068,7 +2174,7 @@ async fn channels_remove(name: String) -> Result<String, String> {
 #[tauri::command]
 async fn channels_login(name: String) -> Result<String, String> {
     run_in_background(move || {
-        let channel_name = ensure_cli_name(&name, "娓犻亾鍚嶇О")?;
+        let channel_name = ensure_cli_name(&name, "渠道名称")?;
         let args = vec![
             "channels".to_string(),
             "login".to_string(),
@@ -2082,7 +2188,7 @@ async fn channels_login(name: String) -> Result<String, String> {
 #[tauri::command]
 async fn channels_logout(name: String) -> Result<String, String> {
     run_in_background(move || {
-        let channel_name = ensure_cli_name(&name, "娓犻亾鍚嶇О")?;
+        let channel_name = ensure_cli_name(&name, "渠道名称")?;
         let args = vec![
             "channels".to_string(),
             "logout".to_string(),
@@ -2158,7 +2264,7 @@ async fn doctor_openclaw_gateway() -> Result<String, String> {
     .await
     .map(|output| {
         if output.trim().is_empty() {
-            "璇婃柇涓庤嚜鍔ㄤ慨澶嶅凡瀹屾垚".to_string()
+            "诊断与自动修复已完成".to_string()
         } else {
             output
         }
@@ -2191,7 +2297,7 @@ fn force_kill_gateway_sync() -> Result<String, String> {
 
         match command.output() {
             Ok(_) => Ok("Gateway force-kill command executed.".to_string()),
-            Err(error) => Err(format!("缁堟缃戝叧杩涚▼澶辫触: {}", error)),
+            Err(error) => Err(format!("终止网关进程失败：{}", error)),
         }
     }
 
@@ -2203,7 +2309,7 @@ fn force_kill_gateway_sync() -> Result<String, String> {
             .output()
         {
             Ok(_) => Ok("Gateway kill command executed.".to_string()),
-            Err(error) => Err(format!("缁堟缃戝叧杩涚▼澶辫触: {}", error)),
+            Err(error) => Err(format!("终止网关进程失败：{}", error)),
         }
     }
 }
@@ -2211,6 +2317,39 @@ fn force_kill_gateway_sync() -> Result<String, String> {
 #[tauri::command]
 async fn force_kill_gateway() -> Result<String, String> {
     run_in_background(force_kill_gateway_sync).await
+}
+
+fn read_gateway_auth_token_sync() -> Result<String, String> {
+    let config_path = openclaw_workspace_dir().join("openclaw.json");
+    if !config_path.exists() {
+        return Err("OpenClaw 配置文件不存在，请先在设置中保存配置以初始化网关".to_string());
+    }
+
+    let content = fs::read_to_string(&config_path)
+        .map_err(|error| format!("读取配置文件 {} 失败：{}", config_path.display(), error))?;
+    if content.trim().is_empty() {
+        return Err("OpenClaw 配置文件为空，请先在设置中保存配置以初始化网关".to_string());
+    }
+    let parsed: Value = serde_json::from_str(&content)
+        .map_err(|error| format!("解析配置文件 JSON 失败：{}", error))?;
+
+    let token = parsed
+        .get("gateway")
+        .and_then(|gw| gw.get("auth"))
+        .and_then(|auth| auth.get("token"))
+        .and_then(|t| t.as_str())
+        .filter(|s| !s.trim().is_empty())
+        .map(ToString::to_string);
+
+    match token {
+        Some(t) => Ok(t),
+        None => Err("网关认证 token 未配置，请在设置中保存配置或启动网关以生成 token".to_string()),
+    }
+}
+
+#[tauri::command]
+async fn get_gateway_auth_token() -> Result<String, String> {
+    run_in_background(read_gateway_auth_token_sync).await
 }
 
 #[tauri::command]
@@ -2223,7 +2362,7 @@ async fn open_openclaw_workspace() -> Result<String, String> {
     run_in_background(|| {
         let workspace = openclaw_workspace_dir();
         fs::create_dir_all(&workspace)
-            .map_err(|error| format!("鍒涘缓宸ヤ綔鍖?{} 澶辫触: {}", workspace.display(), error))?;
+            .map_err(|error| format!("创建工作区 {} 失败：{}", workspace.display(), error))?;
 
         #[cfg(target_os = "windows")]
         {
@@ -2232,7 +2371,7 @@ async fn open_openclaw_workspace() -> Result<String, String> {
             attach_windows_flags(&mut cmd);
             cmd.spawn().map_err(|error| {
                 format!(
-                    "閫氳繃 Explorer 鎵撳紑宸ヤ綔鍖?{} 澶辫触: {}",
+                    "通过 Explorer 打开工作区 {} 失败：{}",
                     workspace.display(),
                     error
                 )
@@ -2246,7 +2385,7 @@ async fn open_openclaw_workspace() -> Result<String, String> {
                 .spawn()
                 .map_err(|error| {
                     format!(
-                        "閫氳繃 Finder 鎵撳紑宸ヤ綔鍖?{} 澶辫触: {}",
+                        "通过 Finder 打开工作区 {} 失败：{}",
                         workspace.display(),
                         error
                     )
@@ -2260,7 +2399,7 @@ async fn open_openclaw_workspace() -> Result<String, String> {
                 .spawn()
                 .map_err(|error| {
                     format!(
-                        "閫氳繃鏂囦欢绠＄悊鍣ㄦ墦寮€宸ヤ綔鍖?{} 澶辫触: {}",
+                        "通过文件管理器打开工作区 {} 失败：{}",
                         workspace.display(),
                         error
                     )
@@ -2278,31 +2417,31 @@ async fn clear_openclaw_data() -> Result<String, String> {
         let workspace = openclaw_workspace_dir();
         if !workspace.exists() {
             fs::create_dir_all(&workspace)
-                .map_err(|error| format!("鍒涘缓宸ヤ綔鍖?{} 澶辫触: {}", workspace.display(), error))?;
+                .map_err(|error| format!("创建工作区 {} 失败：{}", workspace.display(), error))?;
             return Ok("Workspace is already empty".to_string());
         }
 
         let mut removed = 0usize;
         let entries = fs::read_dir(&workspace)
-            .map_err(|error| format!("璇诲彇宸ヤ綔鍖?{} 澶辫触: {}", workspace.display(), error))?;
+            .map_err(|error| format!("读取工作区 {} 失败：{}", workspace.display(), error))?;
 
         for entry in entries {
-            let entry = entry.map_err(|error| format!("璇诲彇鐩綍椤瑰け璐? {}", error))?;
+            let entry = entry.map_err(|error| format!("读取目录项失败：{}", error))?;
             let path = entry.path();
             if path.is_dir() {
                 fs::remove_dir_all(&path)
-                    .map_err(|error| format!("鍒犻櫎鐩綍 {} 澶辫触: {}", path.display(), error))?;
+                    .map_err(|error| format!("删除目录 {} 失败：{}", path.display(), error))?;
             } else {
                 fs::remove_file(&path)
-                    .map_err(|error| format!("鍒犻櫎鏂囦欢 {} 澶辫触: {}", path.display(), error))?;
+                    .map_err(|error| format!("删除文件 {} 失败：{}", path.display(), error))?;
             }
             removed += 1;
         }
 
         Ok(format!(
             "Cleared {} items from {}",
-            workspace.display(),
-            removed
+            removed,
+            workspace.display()
         ))
     })
     .await
@@ -2326,7 +2465,7 @@ async fn disable_im_channel(channel_id: String) -> Result<String, String> {
     run_in_background(move || {
         let channel_id = channel_id.trim().to_string();
         if channel_id.is_empty() {
-            return Err("娓犻亾 ID 涓嶈兘涓虹┖".to_string());
+            return Err("渠道 ID 不能为空".to_string());
         }
 
         let mut entries = merge_channel_entries()?;
@@ -2349,7 +2488,7 @@ async fn delete_im_channel(channel_id: String) -> Result<String, String> {
     run_in_background(move || {
         let channel_id = channel_id.trim().to_string();
         if channel_id.is_empty() {
-            return Err("娓犻亾 ID 涓嶈兘涓虹┖".to_string());
+            return Err("渠道 ID 不能为空".to_string());
         }
 
         let mut entries = merge_channel_entries()?;
@@ -2371,7 +2510,7 @@ async fn pair_im_channel(channel_id: String) -> Result<String, String> {
     run_in_background(move || {
         let channel_id = channel_id.trim().to_string();
         if channel_id.is_empty() {
-            return Err("娓犻亾 ID 涓嶈兘涓虹┖".to_string());
+            return Err("渠道 ID 不能为空".to_string());
         }
 
         let mut entries = merge_channel_entries()?;
@@ -2392,7 +2531,7 @@ async fn pair_im_channel(channel_id: String) -> Result<String, String> {
 }
 
 #[tauri::command]
-fn parse_dropped_file(file_name: String, content: String) -> Result<DroppedFileAnalysis, String> {
+async fn parse_dropped_file(file_name: String, content: String) -> Result<DroppedFileAnalysis, String> {
     let normalized_name = if file_name.trim().is_empty() {
         "untitled".to_string()
     } else {
@@ -2403,7 +2542,7 @@ fn parse_dropped_file(file_name: String, content: String) -> Result<DroppedFileA
     let line_count = content.lines().count();
     let preview = if content.chars().count() > 5000 {
         let shortened: String = content.chars().take(5000).collect();
-        format!("{}\n\n[鍚庣宸叉埅鏂樉绀篯", shortened)
+        format!("{}\n\n[后端已截断显示]", shortened)
     } else {
         content
     };
@@ -2414,6 +2553,205 @@ fn parse_dropped_file(file_name: String, content: String) -> Result<DroppedFileA
         line_count,
         preview,
     })
+}
+
+#[tauri::command]
+async fn download_file_with_progress(
+    app: AppHandle,
+    url: String,
+    output_path: String,
+) -> Result<String, String> {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    #[derive(Debug)]
+    enum DownloadMsg {
+        Progress { progress: u8, stage: String },
+        Error(String),
+        Done(String),
+    }
+
+    let (tx, rx) = mpsc::channel::<DownloadMsg>();
+    let output_path_for_return = output_path.clone();
+
+    std::thread::Builder::new()
+        .name("openclaw-downloader".into())
+        .spawn(move || {
+            let response = match ureq::get(&url).call() {
+                Ok(r) => r,
+                Err(e) => {
+                    let _ = tx.send(DownloadMsg::Error(format!("HTTP 请求失败: {}", e)));
+                    return;
+                }
+            };
+
+            let total_bytes: Option<u64> = response
+                .header("content-length")
+                .and_then(|v| v.parse::<u64>().ok());
+
+            let reader: Box<dyn std::io::Read + Send> = response.into_reader();
+
+            let mut reader = reader;
+            let mut file = match std::fs::File::create(&output_path) {
+                Ok(f) => f,
+                Err(e) => {
+                    let _ = tx.send(DownloadMsg::Error(format!("创建文件 {} 失败: {}", output_path, e)));
+                    return;
+                }
+            };
+
+            let mut bytes_downloaded: u64 = 0;
+            let mut chunk_buf = [0u8; 65536];
+
+            loop {
+                let n = match std::io::Read::read(&mut reader, &mut chunk_buf) {
+                    Ok(n) => n,
+                    Err(e) => {
+                        let _ = tx.send(DownloadMsg::Error(format!("读取下载流失败: {}", e)));
+                        return;
+                    }
+                };
+                if n == 0 {
+                    break;
+                }
+
+                if let Err(e) = std::io::Write::write_all(&mut file, &chunk_buf[..n]) {
+                    let _ = tx.send(DownloadMsg::Error(format!("写入文件失败: {}", e)));
+                    return;
+                }
+
+                bytes_downloaded += n as u64;
+
+                let progress = if let Some(total) = total_bytes {
+                    ((bytes_downloaded as f64 / total as f64) * 80.0) as u8
+                } else {
+                    50u8
+                };
+
+                let size_str = if bytes_downloaded < 1024 * 1024 {
+                    format!("{:.1} KB", bytes_downloaded as f64 / 1024.0)
+                } else {
+                    format!("{:.1} MB", bytes_downloaded as f64 / (1024.0 * 1024.0))
+                };
+
+                let _ = tx.send(DownloadMsg::Progress {
+                    progress,
+                    stage: format!("下载中 ({})", size_str),
+                });
+            }
+
+            let final_size = std::fs::metadata(&output_path)
+                .map(|m| m.len())
+                .unwrap_or(0);
+
+            if final_size < 5 * 1024 * 1024 {
+                let _ = std::fs::remove_file(&output_path);
+                let size_mb = format!("{:.2}", final_size as f64 / (1024.0 * 1024.0));
+                let _ = tx.send(DownloadMsg::Error(format!(
+                    "下载失败：文件体积异常 ({} MB < 5 MB)，可能链接已失效",
+                    size_mb
+                )));
+                return;
+            }
+
+            let _ = tx.send(DownloadMsg::Done(output_path.clone()));
+        })
+        .map_err(|e| format!("启动下载线程失败: {}", e))?;
+
+    loop {
+        match rx.recv_timeout(Duration::from_millis(50)) {
+            Ok(DownloadMsg::Progress { progress, stage }) => {
+                let _ = app.emit("download-progress", serde_json::json!({
+                    "progress": progress,
+                    "stage": stage,
+                    "bytesDownloaded": 0,
+                    "totalBytes": null
+                }));
+            }
+            Ok(DownloadMsg::Done(_)) => {
+                let _ = app.emit("download-progress", serde_json::json!({
+                    "progress": 85,
+                    "stage": "下载完成，正在准备安装...",
+                    "bytesDownloaded": 0,
+                    "totalBytes": null
+                }));
+                return Ok(output_path_for_return);
+            }
+            Ok(DownloadMsg::Error(msg)) => {
+                return Err(msg);
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                continue;
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err("下载线程异常退出".to_string());
+            }
+        }
+    }
+}
+
+#[tauri::command]
+async fn install_openclaw_cli(app: AppHandle) -> Result<String, String> {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let (tx, rx) = mpsc::channel::<Result<String, String>>();
+
+    std::thread::Builder::new()
+        .name("openclaw-npm-install".into())
+        .spawn(move || {
+            let args = ["install".to_string(), "-g".to_string(), "openclaw@latest".to_string()];
+            let output = run_command_output_with_custom_timeout(
+                "npm",
+                &args,
+                NPM_GLOBAL_INSTALL_TIMEOUT_SECONDS,
+            );
+            tx.send(output).ok();
+        })
+        .map_err(|e| format!("启动 npm 安装线程失败: {}", e))?;
+
+    let start = std::time::Instant::now();
+    loop {
+        match rx.recv_timeout(Duration::from_millis(150)) {
+            Ok(Ok(msg)) => {
+                let _ = app.emit("npm-install-progress", serde_json::json!({
+                    "progress": 100,
+                    "stage": "安装完成"
+                }));
+                return Ok(msg);
+            }
+            Ok(Err(e)) => {
+                let _ = app.emit("npm-install-progress", serde_json::json!({
+                    "progress": 0,
+                    "stage": "安装失败"
+                }));
+                return Err(e);
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                let elapsed = start.elapsed().as_secs();
+                let progress = if elapsed < 15 {
+                    ((elapsed as f64 / 15.0) * 90.0) as u8
+                } else {
+                    90u8
+                };
+                let seconds = elapsed;
+                let stage = if seconds < 60 {
+                    format!("正在安装 OpenClaw CLI... ({}s)", seconds)
+                } else {
+                    let mins = seconds / 60;
+                    let secs = seconds % 60;
+                    format!("正在安装 OpenClaw CLI... ({}m{}s)", mins, secs)
+                };
+                let _ = app.emit("npm-install-progress", serde_json::json!({
+                    "progress": progress,
+                    "stage": stage
+                }));
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err("npm 安装线程异常退出".to_string());
+            }
+        }
+    }
 }
 
 fn main() {
@@ -2471,13 +2809,16 @@ fn main() {
             force_kill_gateway,
             restart_openclaw_gateway,
             self_heal_gateway,
+            get_gateway_auth_token,
             open_openclaw_workspace,
             clear_openclaw_data,
             list_im_channels,
             disable_im_channel,
             delete_im_channel,
             pair_im_channel,
-            parse_dropped_file
+            parse_dropped_file,
+            download_file_with_progress,
+            install_openclaw_cli
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

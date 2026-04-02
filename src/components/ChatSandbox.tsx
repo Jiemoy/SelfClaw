@@ -1,8 +1,9 @@
-﻿import { type DragEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { type DragEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { save } from "@tauri-apps/plugin-dialog";
 import { writeTextFile } from "@tauri-apps/plugin-fs";
 import { fetch } from "@tauri-apps/plugin-http";
 import {
+  AlertTriangle,
   Download,
   MessageSquarePlus,
   Paperclip,
@@ -11,6 +12,7 @@ import {
   X,
 } from "lucide-react";
 import { Button } from "@/components/ui";
+import { sendMessageToOpenClaw } from "@/lib/openclaw";
 import { cn, formatTimestamp, generateId } from "@/lib/utils";
 import { type Message, type Session, useAppStore } from "@/store/appStore";
 
@@ -258,59 +260,75 @@ export function ChatSandbox() {
       openclaw.gatewayPort > 0
         ? Math.floor(openclaw.gatewayPort)
         : 18789;
-    const endpointCandidates = [
-      `http://127.0.0.1:${configuredGatewayPort}/v1/chat/completions`,
-      `http://127.0.0.1:${configuredGatewayPort}/openai/v1/chat/completions`,
-      `http://127.0.0.1:${configuredGatewayPort}/api/chat/completions`,
-    ];
-    const apiKey = openclaw.apiKey?.trim() ?? "";
+    const gatewayToken = openclaw.gatewayToken?.trim() ?? "";
+    const llmApiKey = openclaw.apiKey?.trim() ?? "";
     const model =
       openclaw.defaultModel?.trim() ||
       openclaw.model?.trim() ||
       "codex-mini-latest";
 
     try {
-      const body = JSON.stringify({
+      // 1. WebSocket native protocol — primary method; gateway handles provider routing automatically
+      setStatusText("通过 WebSocket 连接网关...");
+      const wsResult = await sendMessageToOpenClaw(userMessage.content, {
+        apiKey: llmApiKey,
+        baseUrl: openclaw.baseUrl,
         model,
-        messages: formattedMessages,
+        provider: openclaw.provider,
+        systemPrompt: openclaw.systemPrompt,
+        temperature: openclaw.temperature,
+        maxTokens: openclaw.maxTokens,
+        gatewayToken: gatewayToken || undefined,
+        gatewayPort: configuredGatewayPort,
+        sessionKey: `selfclaw-sandbox-${sessionId}`,
       });
-      const headers = {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${apiKey || "local"}`,
-      };
 
-      let response: Response | null = null;
-      for (let index = 0; index < endpointCandidates.length; index += 1) {
-        const candidate = endpointCandidates[index];
-        const candidateResponse = await fetch(candidate, {
-          method: "POST",
-          headers,
-          body,
-        });
-        if (candidateResponse.status === 404 && index < endpointCandidates.length - 1) {
-          continue;
+      let assistantContent: string | null = null;
+      if (wsResult.success && wsResult.response?.trim()) {
+        assistantContent = wsResult.response.trim();
+      } else {
+        // 2. HTTP OpenAI-compatible API — fallback when WebSocket fails
+        const httpEndpointCandidates = [
+          `http://127.0.0.1:${configuredGatewayPort}/v1/chat/completions`,
+          `http://127.0.0.1:${configuredGatewayPort}/openai/v1/chat/completions`,
+        ];
+        const body = JSON.stringify({ model, messages: formattedMessages });
+        // Use gateway token for HTTP auth (required when gateway auth.mode=token)
+        const authToken = gatewayToken || llmApiKey || "local";
+        const headers = {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${authToken}`,
+        };
+
+        setStatusText("WebSocket 不可用，尝试 HTTP 直连...");
+        let httpError: string | null = null;
+
+        for (let idx = 0; idx < httpEndpointCandidates.length; idx++) {
+          const endpoint = httpEndpointCandidates[idx];
+          const resp = await fetch(endpoint, { method: "POST", headers, body });
+          if (resp.status === 404 && idx < httpEndpointCandidates.length - 1) continue;
+          if (!resp.ok) {
+            const failedText = await resp.text();
+            httpError = `HTTP ${resp.status}: ${failedText || resp.statusText}`;
+            break;
+          }
+          const payload = (await resp.json()) as ChatCompletionResponse;
+          if (payload.error?.message) {
+            httpError = payload.error.message;
+            break;
+          }
+          assistantContent = extractAssistantContent(payload);
+          break;
         }
-        response = candidateResponse;
-        break;
+
+        // If both WS and HTTP failed, throw detailed error
+        if (!assistantContent) {
+          const wsErr = wsResult.error ?? "";
+          const hint = wsErr ? `（WebSocket: ${wsErr}）` : "";
+          throw new Error(`${httpError}${hint}`);
+        }
       }
 
-      if (!response) {
-        throw new Error("本地网关未暴露可用的聊天接口");
-      }
-
-      if (!response.ok) {
-        const failedText = await response.text();
-        throw new Error(
-          `请求失败 (${response.status} ${response.statusText})${failedText ? `: ${failedText}` : ""}`
-        );
-      }
-
-      const payload = (await response.json()) as ChatCompletionResponse;
-      if (payload.error?.message) {
-        throw new Error(payload.error.message);
-      }
-
-      const assistantContent = extractAssistantContent(payload);
       if (!assistantContent) {
         throw new Error("模型未返回可解析的回复内容");
       }
@@ -507,6 +525,25 @@ export function ChatSandbox() {
         </header>
 
         <div ref={messageContainerRef} className="flex-1 overflow-y-auto p-5">
+          {gatewayStatus !== "running" && (
+            <div className="mb-4 flex items-start gap-3 rounded-xl border border-orange-500/40 bg-orange-500/10 px-4 py-3">
+              <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-orange-400" />
+              <div className="min-w-0 flex-1">
+                <p className="text-sm font-medium text-orange-300">
+                  {gatewayStatus === "starting"
+                    ? "本地网关正在启动，请稍候..."
+                    : gatewayStatus === "stopping"
+                    ? "本地网关正在停止..."
+                    : "本地网关未启动"}
+                </p>
+                {gatewayStatus === "offline" && (
+                  <p className="mt-0.5 text-xs text-orange-400/80">
+                    请前往「控制大盘」启动网关后再发送消息。
+                  </p>
+                )}
+              </div>
+            </div>
+          )}
           {!currentSession || currentSession.messages.length === 0 ? (
             <div className="rounded-xl border border-dashed border-neutral-700 bg-neutral-800/40 p-6 text-center text-neutral-400">
               输入消息或拖入文件，开始当前会话。

@@ -1,4 +1,4 @@
-﻿import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { LoaderCircle, Sparkles } from "lucide-react";
 import { Button } from "@/components/ui";
@@ -42,6 +42,7 @@ export function Onboarding({ onComplete }: OnboardingProps) {
   const [customName, setCustomName] = useState(openclaw.customName ?? "SelfClaw");
   const [detectedConfig, setDetectedConfig] = useState<Partial<OpenClawConfig> | null>(null);
   const [isDetecting, setIsDetecting] = useState(true);
+  const [showSkipHint, setShowSkipHint] = useState(false);
 
   useEffect(() => {
     let isMounted = true;
@@ -127,15 +128,36 @@ export function Onboarding({ onComplete }: OnboardingProps) {
 
   const disableForm = Boolean(detectedConfig);
 
+  const saveConfigToDisk = async (config: Partial<OpenClawConfig>) => {
+    try {
+      await invoke<string>("update_openclaw_config", {
+        payload: {
+          provider: config.provider,
+          model: config.model,
+          defaultModel: config.model,
+          apiKey: config.apiKey ?? "",
+          baseUrl: config.baseUrl ?? "",
+          customName: config.customName ?? "SelfClaw",
+        },
+      });
+    } catch (err) {
+      if (!isIgnorableTauriInvokeError(err)) {
+        console.error("[Onboarding] 保存配置到磁盘失败:", err);
+      }
+    }
+  };
+
   const saveAndContinue = () => {
-    setOpenClawConfig({
+    const config: Partial<OpenClawConfig> = {
       installed: true,
       provider,
       model,
       apiKey: apiKey.trim(),
       baseUrl: baseUrl.trim(),
       customName: customName.trim(),
-    });
+    };
+    setOpenClawConfig(config);
+    void saveConfigToDisk(config);
     onComplete();
   };
 
@@ -144,19 +166,35 @@ export function Onboarding({ onComplete }: OnboardingProps) {
       return;
     }
 
-    setOpenClawConfig({
+    const config: Partial<OpenClawConfig> = {
       installed: true,
       provider: detectedConfig.provider ?? provider,
       model: detectedConfig.model ?? model,
       apiKey: (detectedConfig.apiKey ?? apiKey).trim(),
       baseUrl: (detectedConfig.baseUrl ?? baseUrl).trim(),
       customName: customName.trim(),
-    });
+    };
+    setOpenClawConfig(config);
+    void saveConfigToDisk(config);
     onComplete();
   };
 
   const switchToManualConfig = () => {
     setDetectedConfig(null);
+  };
+
+  const handleSkipWizard = () => {
+    const config: Partial<OpenClawConfig> = {
+      installed: true,
+      provider,
+      model,
+      apiKey: apiKey.trim(),
+      baseUrl: baseUrl.trim(),
+      customName: customName.trim(),
+    };
+    setOpenClawConfig(config);
+    void saveConfigToDisk(config);
+    onComplete();
   };
 
   const controlClass = `h-10 w-full rounded-lg border border-neutral-700 bg-neutral-800 px-3 text-sm text-neutral-100 outline-none ring-orange-500 focus:ring-2 ${
@@ -296,13 +334,23 @@ export function Onboarding({ onComplete }: OnboardingProps) {
                   ✓ 已完成本地扫描：未检测到既有配置，请手动输入。
                 </p>
               ) : null}
-              <Button
-                className="bg-orange-500 text-white hover:bg-orange-400"
-                onClick={saveAndContinue}
-                disabled={isDetecting}
-              >
-                {isDetecting ? "正在扫描..." : "完成设置"}
-              </Button>
+              <div className="flex items-center gap-2">
+                <Button
+                  variant="outline"
+                  className="border-neutral-600 bg-neutral-800 text-neutral-400 hover:border-neutral-500 hover:bg-neutral-700 hover:text-neutral-200"
+                  onClick={handleSkipWizard}
+                  disabled={isDetecting}
+                >
+                  我已手动安装 / 强制跳过向导
+                </Button>
+                <Button
+                  className="bg-orange-500 text-white hover:bg-orange-400"
+                  onClick={saveAndContinue}
+                  disabled={isDetecting}
+                >
+                  {isDetecting ? "正在扫描..." : "完成设置"}
+                </Button>
+              </div>
             </div>
           )}
         </div>

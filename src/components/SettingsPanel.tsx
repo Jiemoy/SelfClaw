@@ -1,4 +1,4 @@
-﻿import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { AlertTriangle, RotateCcw, Save } from "lucide-react";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui";
@@ -23,6 +23,7 @@ export function SettingsPanel() {
   const [httpProxy, setHttpProxy] = useState(openclaw.httpProxy ?? "");
   const [socks5Proxy, setSocks5Proxy] = useState(openclaw.socks5Proxy ?? "");
   const [gatewayPort, setGatewayPort] = useState(openclaw.gatewayPort ?? 18789);
+  const [gatewayToken, setGatewayToken] = useState(openclaw.gatewayToken ?? "");
   const [logLevel, setLogLevel] = useState<LogLevel>(openclaw.logLevel ?? "info");
   const [historyMessageLimit, setHistoryMessageLimit] = useState(
     openclaw.historyMessageLimit ?? 10
@@ -52,6 +53,7 @@ export function SettingsPanel() {
     setHttpProxy(openclaw.httpProxy ?? "");
     setSocks5Proxy(openclaw.socks5Proxy ?? "");
     setGatewayPort(openclaw.gatewayPort ?? 18789);
+    setGatewayToken(openclaw.gatewayToken ?? "");
     setLogLevel(openclaw.logLevel ?? "info");
     setHistoryMessageLimit(openclaw.historyMessageLimit ?? 10);
     setLongTermMemoryEnabled(openclaw.longTermMemoryEnabled ?? false);
@@ -95,6 +97,7 @@ export function SettingsPanel() {
     const trimmedSystemPrompt = systemPrompt.trim();
     const trimmedHttpProxy = httpProxy.trim();
     const trimmedSocks5Proxy = socks5Proxy.trim();
+    const trimmedGatewayToken = gatewayToken.trim();
     const trimmedCustomName = openclaw.customName?.trim();
 
     const nextConfig = {
@@ -108,6 +111,7 @@ export function SettingsPanel() {
       httpProxy: trimmedHttpProxy,
       socks5Proxy: trimmedSocks5Proxy,
       gatewayPort: normalizedGatewayPort,
+      gatewayToken: trimmedGatewayToken,
       logLevel,
       historyMessageLimit: normalizedHistoryLimit,
       longTermMemoryEnabled,
@@ -116,30 +120,46 @@ export function SettingsPanel() {
 
     setSaveWorking(true);
     try {
-      await invoke<string>("update_openclaw_config", {
-        payload: {
-          provider,
-          model,
-          defaultModel: model,
-          apiKey: trimmedApiKey,
-          baseUrl: trimmedBaseUrl,
-          systemPrompt: trimmedSystemPrompt,
-          temperature: normalizedTemperature,
-          maxTokens: normalizedMaxTokens,
-          httpProxy: trimmedHttpProxy,
-          socks5Proxy: trimmedSocks5Proxy,
-          gatewayPort: normalizedGatewayPort,
-          logLevel,
-          historyMessageLimit: normalizedHistoryLimit,
-          longTermMemoryEnabled,
-          autostartEnabled,
-          customName: trimmedCustomName,
-          theme: settings.theme,
-        },
+      const result = await new Promise<string>(async (resolve, reject) => {
+        const timer = window.setTimeout(
+          () => reject(new Error("保存超时（10s），请重试")),
+          10000
+        );
+        try {
+          const result = await invoke<string>("update_openclaw_config", {
+            payload: {
+              provider,
+              model,
+              defaultModel: model,
+              apiKey: trimmedApiKey,
+              baseUrl: trimmedBaseUrl,
+              systemPrompt: trimmedSystemPrompt,
+              temperature: normalizedTemperature,
+              maxTokens: normalizedMaxTokens,
+              httpProxy: trimmedHttpProxy,
+              socks5Proxy: trimmedSocks5Proxy,
+              gatewayPort: normalizedGatewayPort,
+              gatewayToken: trimmedGatewayToken,
+              logLevel,
+              historyMessageLimit: normalizedHistoryLimit,
+              longTermMemoryEnabled,
+              autostartEnabled,
+              customName: trimmedCustomName,
+              theme: settings.theme,
+            },
+          });
+          clearTimeout(timer);
+          resolve(result);
+        } catch (error) {
+          clearTimeout(timer);
+          reject(error);
+        }
       });
 
       setOpenClawConfig(nextConfig);
-      setStatus("设置已保存：底层配置已通过 CLI 同步，UI 偏好已写入 ~/.openclaw/selfclaw-ui.json");
+      setStatus(
+        "设置已保存：底层配置已写入 ~/.openclaw/openclaw.json，UI 偏好已写入 ~/.openclaw/selfclaw-ui.json"
+      );
     } catch (error) {
       setStatus(`设置保存失败：${String(error)}`);
     } finally {
@@ -388,6 +408,18 @@ export function SettingsPanel() {
                 <option value="debug">Debug</option>
                 <option value="error">Error</option>
               </select>
+            </div>
+
+            <div className="space-y-2 sm:col-span-2">
+              <label className="text-xs uppercase tracking-wide text-neutral-400">网关认证 Token</label>
+              <input
+                type="password"
+                value={gatewayToken}
+                onChange={(event) => setGatewayToken(event.target.value)}
+                placeholder="留空则自动使用 API Key"
+                className="h-10 w-full rounded-lg border border-neutral-700 bg-neutral-900 px-3 text-sm text-neutral-100 outline-none ring-orange-500 focus:ring-2"
+              />
+              <p className="text-xs text-neutral-500">用于 WebSocket 认证，可从 ~/.openclaw/openclaw.json 中 gateway.auth.token 字段获取</p>
             </div>
           </div>
         </TabsContent>

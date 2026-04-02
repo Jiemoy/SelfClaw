@@ -1,4 +1,4 @@
-﻿import { type ReactNode, useCallback, useEffect, useRef, useState } from "react";
+import { type ReactNode, useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { ConsoleShell } from "@/components/ConsoleShell";
@@ -11,6 +11,7 @@ import { type OpenClawConfig, useAppStore } from "@/store/appStore";
 interface BootOutcome {
   isSetupComplete: boolean;
   mappedConfig?: Partial<OpenClawConfig>;
+  gatewayToken?: string | null;
 }
 
 let bootDetectionPromise: Promise<BootOutcome> | null = null;
@@ -81,11 +82,17 @@ function readBooleanField(
 }
 
 async function detectBootConfigOnce(): Promise<BootOutcome> {
+  let gatewayToken: string | null = null;
   try {
-    const payload = await invoke<Record<string, unknown>>(
-      "auto_detect_openclaw_config"
-    );
+    const [payload, tokenResult] = await Promise.all([
+      invoke<Record<string, unknown>>("auto_detect_openclaw_config"),
+      invoke<string>("get_gateway_auth_token").catch(() => null),
+    ]);
+    gatewayToken = tokenResult;
     console.log("【底层配置嗅探结果】:", JSON.stringify(payload, null, 2));
+    if (gatewayToken) {
+      console.log("【网关 Token】: 已获取（已脱敏）");
+    }
 
     const targetData = asRecord(payload.data) ?? asRecord(payload.config) ?? payload;
     const apiKey =
@@ -183,6 +190,7 @@ async function detectBootConfigOnce(): Promise<BootOutcome> {
 
     return {
       isSetupComplete: true,
+      gatewayToken,
       mappedConfig: {
         installed: true,
         apiKey,
@@ -210,7 +218,7 @@ async function detectBootConfigOnce(): Promise<BootOutcome> {
     if (!isIgnorableTauriInvokeError(error)) {
       console.error("自动接管本地 OpenClaw 配置失败：", error);
     }
-    return { isSetupComplete: false };
+    return { isSetupComplete: false, gatewayToken };
   }
 }
 
@@ -343,6 +351,7 @@ function App() {
             longTermMemoryEnabled: result.mappedConfig?.longTermMemoryEnabled,
             autostartEnabled: result.mappedConfig?.autostartEnabled,
             customName: result.mappedConfig?.customName,
+            gatewayToken: result.gatewayToken ?? undefined,
           });
           showToast("已无缝接入本地 OpenClaw 配置");
           return;
@@ -354,6 +363,7 @@ function App() {
           installed: false,
           apiKey: undefined,
           baseUrl: undefined,
+          gatewayToken: result.gatewayToken ?? undefined,
         });
       })
       .catch((error) => {

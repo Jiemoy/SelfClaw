@@ -11,6 +11,7 @@
     "core:window:allow-toggle-maximize",
     "core:window:allow-close",
     "core:webview:default",
+    "fs:default",
     "dialog:allow-open",
     "dialog:allow-save",
     "dialog:allow-confirm",
@@ -21,8 +22,7 @@
       "allow": [
         { "path": "$APPDATA/**" },
         { "path": "$LOCALAPPDATA/**" },
-        { "path": "$HOME/.openclaw/**" },
-        { "path": "$HOME/OpenClaw/**" }
+        { "path": "$HOME/**" }
       ]
     },
     {
@@ -30,11 +30,23 @@
       "allow": [
         { "path": "$APPDATA/**" },
         { "path": "$LOCALAPPDATA/**" },
-        { "path": "$HOME/.openclaw/**" },
-        { "path": "$HOME/OpenClaw/**" },
-        { "path": "$DESKTOP/**" },
-        { "path": "$DOCUMENT/**" },
-        { "path": "$DOWNLOAD/**" }
+        { "path": "$HOME/**" }
+      ]
+    },
+    {
+      "identifier": "fs:allow-mkdir",
+      "allow": [
+        { "path": "$APPDATA/**" },
+        { "path": "$LOCALAPPDATA/**" },
+        { "path": "$HOME/**" }
+      ]
+    },
+    {
+      "identifier": "fs:allow-exists",
+      "allow": [
+        { "path": "$APPDATA/**" },
+        { "path": "$LOCALAPPDATA/**" },
+        { "path": "$HOME/**" }
       ]
     },
     {
@@ -42,8 +54,7 @@
       "allow": [
         { "path": "$APPDATA/**" },
         { "path": "$LOCALAPPDATA/**" },
-        { "path": "$HOME/.openclaw/**" },
-        { "path": "$HOME/OpenClaw/**" }
+        { "path": "$HOME/**" }
       ]
     },
     {
@@ -51,8 +62,39 @@
       "allow": [
         { "path": "$APPDATA/**" },
         { "path": "$LOCALAPPDATA/**" },
-        { "path": "$HOME/.openclaw/**" },
-        { "path": "$HOME/OpenClaw/**" }
+        { "path": "$HOME/**" }
+      ]
+    },
+    {
+      "identifier": "fs:allow-remove",
+      "allow": [
+        { "path": "$APPDATA/**" },
+        { "path": "$LOCALAPPDATA/**" },
+        { "path": "$HOME/**" }
+      ]
+    },
+    {
+      "identifier": "fs:allow-copy-file",
+      "allow": [
+        { "path": "$APPDATA/**" },
+        { "path": "$LOCALAPPDATA/**" },
+        { "path": "$HOME/**" }
+      ]
+    },
+    {
+      "identifier": "fs:allow-write-file",
+      "allow": [
+        { "path": "$APPDATA/**" },
+        { "path": "$LOCALAPPDATA/**" },
+        { "path": "$HOME/**" }
+      ]
+    },
+    {
+      "identifier": "fs:allow-read-file",
+      "allow": [
+        { "path": "$APPDATA/**" },
+        { "path": "$LOCALAPPDATA/**" },
+        { "path": "$HOME/**" }
       ]
     },
     {

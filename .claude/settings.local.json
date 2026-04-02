@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(dir /b)",
+      "Bash(python3 -:*)",
+      "Bash(where python:*)",
+      "Bash(where node:*)",
+      "Bash(node -e \":*)",
+      "Bash(npx tsc:*)"
+    ]
+  }
+}

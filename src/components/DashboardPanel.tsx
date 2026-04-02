@@ -94,10 +94,19 @@ export function DashboardPanel() {
         return;
       }
 
-      setGatewayStatus(next.running ? "running" : "offline");
-      setGatewayPid(next.pid);
-      setLastCheckedAt(next.checked_at);
+      const now = Math.floor(Date.now() / 1000);
+      setLastCheckedAt(now);
       setStatusFailed(false);
+
+      if (next.running) {
+        setGatewayStatus("running");
+        setGatewayPid(next.pid);
+      } else {
+        // Gateway is not running — always show offline regardless of current state.
+        // Also clear PID since the process is gone.
+        setGatewayStatus("offline");
+        setGatewayPid(undefined);
+      }
     } catch (error) {
       if (!mountedRef.current || isIgnorableTauriInvokeError(error)) {
         return;
@@ -213,12 +222,6 @@ export function DashboardPanel() {
       setIsLoading(true);
       setActiveAction(action);
 
-      if (action === "start" || action === "restart") {
-        setGatewayStatus("starting");
-      } else if (action === "stop") {
-        setGatewayStatus("stopping");
-      }
-
       appendTerminalLog(`\n> ${commandEcho}`);
 
       invoke<string>(command)
@@ -227,17 +230,12 @@ export function DashboardPanel() {
             return;
           }
           appendTerminalLog(result && result.trim() ? result : defaultSuccessMessage);
-
-          const now = Math.floor(Date.now() / 1000);
-          setLastCheckedAt(now);
           setStatusFailed(false);
 
           if (action === "start" || action === "restart") {
             setGatewayStatus("running");
-          } else if (action === "stop") {
-            setGatewayStatus("offline");
-            setGatewayPid(undefined);
           }
+          // For stop, DO NOT set status here — let fetchGatewayStatus confirm it below.
         })
         .catch((error) => {
           if (!mountedRef.current || isIgnorableTauriInvokeError(error)) {
@@ -246,17 +244,75 @@ export function DashboardPanel() {
           appendTerminalLog(`[error] 操作失败：${String(error)}`);
         })
         .finally(() => {
-          void fetchGatewayStatus().finally(() => {
+          if (!mountedRef.current) {
             requestLockRef.current = false;
-            if (!mountedRef.current) {
-              return;
-            }
             setIsLoading(false);
             setActiveAction(null);
-          });
+            return;
+          }
+
+          // After stop, poll gateway status until it confirms the port is free
+          // (port may linger briefly in TIME_WAIT after kill).
+          if (action === "stop") {
+            setGatewayStatus("stopping");
+            pollUntilOffline(0);
+          } else {
+            void fetchGatewayStatus().finally(() => {
+              requestLockRef.current = false;
+              if (!mountedRef.current) {
+                return;
+              }
+              setIsLoading(false);
+              setActiveAction(null);
+            });
+          }
         });
     },
     [appendTerminalLog, fetchGatewayStatus, setGatewayStatus]
+  );
+
+  // Polls the gateway status up to 15 times (≈15s) until it confirms offline.
+  // Resolves race between async kill and port being freed (TIME_WAIT).
+  const pollUntilOffline = useCallback(
+    (attempt: number) => {
+      if (!mountedRef.current) {
+        requestLockRef.current = false;
+        setIsLoading(false);
+        setActiveAction(null);
+        return;
+      }
+      if (attempt >= 15) {
+        // Give up — try one final probe to sync state
+        appendTerminalLog("[warn] 网关端口未释放，执行最终状态同步...");
+        void fetchGatewayStatus().finally(() => {
+          requestLockRef.current = false;
+          if (!mountedRef.current) return;
+          setIsLoading(false);
+          setActiveAction(null);
+        });
+        return;
+      }
+
+      void fetchGatewayStatus().then((result) => {
+        // result is undefined since fetchGatewayStatus returns void.
+        // Check the current store state directly.
+        const currentStatus = useAppStore.getState().gatewayStatus;
+        if (currentStatus === "offline") {
+          if (!mountedRef.current) return;
+          setIsLoading(false);
+          setActiveAction(null);
+          requestLockRef.current = false;
+          appendTerminalLog("网关已停止");
+          return;
+        }
+        // Not yet offline — wait 1s and poll again
+        setTimeout(() => {
+          if (!mountedRef.current) return;
+          pollUntilOffline(attempt + 1);
+        }, 1000);
+      });
+    },
+    [appendTerminalLog, fetchGatewayStatus]
   );
 
   const formattedTime = lastCheckedAt

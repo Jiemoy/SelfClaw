@@ -39,6 +39,7 @@ export interface OpenClawConfig {
   historyMessageLimit?: number;
   longTermMemoryEnabled?: boolean;
   autostartEnabled?: boolean;
+  gatewayToken?: string;
 }
 
 // 默认配置
