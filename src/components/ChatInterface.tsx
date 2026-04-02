@@ -117,6 +117,7 @@ export function ChatInterface() {
   const [infoText, setInfoText] = useState("");
   const [exporting, setExporting] = useState(false);
   const [selectedModel, setSelectedModel] = useState(openclaw.model ?? "codex-mini-latest");
+  const [streamingDrafts, setStreamingDrafts] = useState<Record<string, string>>({});
 
   const mountedRef = useRef(true);
 
@@ -210,6 +211,7 @@ export function ChatInterface() {
         content: "",
         timestamp: Date.now(),
       });
+      setStreamingDrafts((previous) => ({ ...previous, [assistantId]: "" }));
 
       if (mountedRef.current) {
         setBusy(true);
@@ -222,7 +224,11 @@ export function ChatInterface() {
             return;
           }
           streamText += chunk;
-          updateMessage(sessionId, assistantId, { content: streamText });
+          setStreamingDrafts((previous) =>
+            previous[assistantId] === streamText
+              ? previous
+              : { ...previous, [assistantId]: streamText }
+          );
         };
 
         const result = await sendMessageToOpenClaw(
@@ -247,12 +253,26 @@ export function ChatInterface() {
             content: result.error ?? "网关返回未知错误",
           });
         }
+        const finalContent = result.response?.trim() || streamText.trim();
+        if (result.success) {
+          updateMessage(sessionId, assistantId, {
+            content: finalContent || " ",
+          });
+        }
+        setStreamingDrafts((previous) => {
+          const { [assistantId]: _removed, ...rest } = previous;
+          return rest;
+        });
       } catch (error) {
         if (isIgnorableTauriInvokeError(error)) {
           return;
         }
         updateMessage(sessionId, assistantId, {
           content: `请求失败：${String(error)}`,
+        });
+        setStreamingDrafts((previous) => {
+          const { [assistantId]: _removed, ...rest } = previous;
+          return rest;
         });
       } finally {
         if (mountedRef.current) {
@@ -489,7 +509,11 @@ export function ChatInterface() {
               开始对话，或将文件拖入下方输入区。
             </div>
           ) : (
-            currentSession.messages.map((message) => (
+            currentSession.messages.map((message) => {
+              const isStreaming = Object.prototype.hasOwnProperty.call(streamingDrafts, message.id);
+              const content = isStreaming ? streamingDrafts[message.id] ?? "" : message.content;
+
+              return (
               <article key={message.id} className="space-y-1">
                 <div className="flex items-center justify-between text-xs text-neutral-500">
                   <span className="tracking-wide">{ROLE_LABELS[message.role]}</span>
@@ -503,12 +527,19 @@ export function ChatInterface() {
                       : "border-neutral-700 bg-neutral-800 text-neutral-100"
                   )}
                 >
-                  <Suspense fallback={<pre className="whitespace-pre-wrap">{message.content}</pre>}>
-                    <LazyMarkdownMessage content={message.content} />
-                  </Suspense>
+                  {isStreaming ? (
+                    <pre className="whitespace-pre-wrap break-words font-sans">
+                      {content || "正在回复..."}
+                    </pre>
+                  ) : (
+                    <Suspense fallback={<pre className="whitespace-pre-wrap">{content}</pre>}>
+                      <LazyMarkdownMessage content={content} />
+                    </Suspense>
+                  )}
                 </div>
               </article>
-            ))
+              );
+            })
           )}
         </div>
 

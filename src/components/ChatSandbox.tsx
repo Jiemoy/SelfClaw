@@ -12,7 +12,7 @@ import {
   X,
 } from "lucide-react";
 import { Button } from "@/components/ui";
-import { sendMessageToOpenClaw } from "@/lib/openclaw";
+import { sendMessageToOpenClaw, type StreamCallback } from "@/lib/openclaw";
 import { cn, formatTimestamp, generateId } from "@/lib/utils";
 import { type Message, type Session, useAppStore } from "@/store/appStore";
 
@@ -114,6 +114,7 @@ export function ChatSandbox() {
     addSession,
     setCurrentSession,
     addMessage,
+    updateMessage,
     deleteSession,
   } = useAppStore();
 
@@ -124,6 +125,7 @@ export function ChatSandbox() {
   const [isSending, setIsSending] = useState(false);
   const [statusText, setStatusText] = useState("");
   const [errorText, setErrorText] = useState("");
+  const [streamingDrafts, setStreamingDrafts] = useState<Record<string, string>>({});
 
   const dragCounterRef = useRef(0);
   const messageContainerRef = useRef<HTMLDivElement | null>(null);
@@ -145,7 +147,7 @@ export function ChatSandbox() {
       return;
     }
     container.scrollTop = container.scrollHeight;
-  }, [currentSession?.messages]);
+  }, [currentSession?.messages, streamingDrafts]);
 
   const ensureSession = useCallback((): string => {
     if (currentSessionId) {
@@ -249,6 +251,15 @@ export function ChatSandbox() {
       },
     ];
 
+    const assistantId = generateId();
+    addMessage(sessionId, {
+      id: assistantId,
+      role: "assistant",
+      content: "",
+      timestamp: Date.now(),
+    });
+    setStreamingDrafts((previous) => ({ ...previous, [assistantId]: "" }));
+
     setInput("");
     setPendingAttachments([]);
     setStatusText("消息已写入当前会话，正在请求模型...");
@@ -268,6 +279,24 @@ export function ChatSandbox() {
       "codex-mini-latest";
 
     try {
+      let streamText = "";
+      const onStream: StreamCallback = (chunk, done) => {
+        if (done) {
+          if (streamText.trim()) {
+            setStatusText("AI 正在整理回复...");
+          }
+          return;
+        }
+
+        streamText += chunk;
+        setStatusText("AI 正在回复...");
+        setStreamingDrafts((previous) =>
+          previous[assistantId] === streamText
+            ? previous
+            : { ...previous, [assistantId]: streamText }
+        );
+      };
+
       // 1. WebSocket native protocol — primary method; gateway handles provider routing automatically
       setStatusText("通过 WebSocket 连接网关...");
       const wsResult = await sendMessageToOpenClaw(userMessage.content, {
@@ -281,15 +310,13 @@ export function ChatSandbox() {
         gatewayToken: gatewayToken || undefined,
         gatewayPort: configuredGatewayPort,
         sessionKey: `selfclaw-sandbox-${sessionId}`,
-      });
+      }, onStream);
 
-      if (!wsResult.success || !wsResult.response?.trim()) {
-        throw new Error(wsResult.error ?? "Gateway returned an empty response.");
+      if (!wsResult.success) {
+        throw new Error(wsResult.error ?? "Gateway request failed.");
       }
-      let assistantContent: string | null = null;
-      if (wsResult.success && wsResult.response?.trim()) {
-        assistantContent = wsResult.response.trim();
-      } else {
+      let assistantContent: string | null = wsResult.response?.trim() || streamText.trim() || null;
+      if (!assistantContent) {
         // 2. HTTP OpenAI-compatible API — fallback when WebSocket fails
         const httpEndpointCandidates = [
           `http://127.0.0.1:${configuredGatewayPort}/v1/chat/completions`,
@@ -336,14 +363,20 @@ export function ChatSandbox() {
         throw new Error("模型未返回可解析的回复内容");
       }
 
-      addMessage(sessionId, {
-        id: generateId(),
-        role: "assistant",
-        content: assistantContent,
-        timestamp: Date.now(),
+      updateMessage(sessionId, assistantId, { content: assistantContent });
+      setStreamingDrafts((previous) => {
+        const { [assistantId]: _removed, ...rest } = previous;
+        return rest;
       });
       setStatusText("模型回复已写入当前会话");
     } catch (error) {
+      updateMessage(sessionId, assistantId, {
+        content: `发送失败：${String(error)}`,
+      });
+      setStreamingDrafts((previous) => {
+        const { [assistantId]: _removed, ...rest } = previous;
+        return rest;
+      });
       setErrorText(`发送失败：${String(error)}`);
     } finally {
       setIsSending(false);
@@ -553,7 +586,11 @@ export function ChatSandbox() {
             </div>
           ) : (
             <div className="space-y-4">
-              {currentSession.messages.map((message) => (
+              {currentSession.messages.map((message) => {
+                const isStreaming = Object.prototype.hasOwnProperty.call(streamingDrafts, message.id);
+                const displayContent = isStreaming ? streamingDrafts[message.id] ?? "" : message.content;
+
+                return (
                 <article key={message.id} className="space-y-1">
                   <div className="flex items-center justify-between text-xs text-neutral-500">
                     <span>{ROLE_LABELS[message.role]}</span>
@@ -567,7 +604,9 @@ export function ChatSandbox() {
                         : "border-neutral-700 bg-neutral-800 text-neutral-100"
                     )}
                   >
-                    <p className="whitespace-pre-wrap break-words">{message.content}</p>
+                    <p className="whitespace-pre-wrap break-words">
+                      {displayContent || (isStreaming ? "正在回复..." : "")}
+                    </p>
                     {message.files?.length ? (
                       <div className="mt-2 space-y-1 text-xs text-neutral-400">
                         {message.files.map((fileName) => (
@@ -579,7 +618,8 @@ export function ChatSandbox() {
                     ) : null}
                   </div>
                 </article>
-              ))}
+                );
+              })}
             </div>
           )}
         </div>
