@@ -283,6 +283,9 @@ export function ChatSandbox() {
         sessionKey: `selfclaw-sandbox-${sessionId}`,
       });
 
+      if (!wsResult.success || !wsResult.response?.trim()) {
+        throw new Error(wsResult.error ?? "Gateway returned an empty response.");
+      }
       let assistantContent: string | null = null;
       if (wsResult.success && wsResult.response?.trim()) {
         assistantContent = wsResult.response.trim();
@@ -651,4 +654,3 @@ export function ChatSandbox() {
     </section>
   );
 }
-

@@ -183,7 +183,7 @@ export function ChatInterface() {
 
   const sendPrompt = useCallback(
     async (prompt: string, sessionId: string) => {
-      if (!openclaw.apiKey) {
+      if (!openclaw.apiKey && !openclaw.gatewayToken) {
         addMessage(sessionId, {
           id: generateId(),
           role: "assistant",
@@ -229,12 +229,15 @@ export function ChatInterface() {
           prompt,
           {
             apiKey: openclaw.apiKey,
+            gatewayToken: openclaw.gatewayToken,
+            gatewayPort: openclaw.gatewayPort,
             provider: openclaw.provider,
             model: selectedModel,
             baseUrl: openclaw.baseUrl,
             systemPrompt: openclaw.systemPrompt,
             temperature: openclaw.temperature,
             maxTokens: openclaw.maxTokens,
+            sessionKey: `selfclaw-chat-${sessionId}`,
           },
           onStream
         );
@@ -262,6 +265,8 @@ export function ChatInterface() {
       gatewayRunning,
       openclaw.apiKey,
       openclaw.baseUrl,
+      openclaw.gatewayPort,
+      openclaw.gatewayToken,
       openclaw.maxTokens,
       openclaw.provider,
       openclaw.systemPrompt,

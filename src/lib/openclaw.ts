@@ -352,8 +352,6 @@ function buildGatewayAgentParams(
   const params: Record<string, unknown> = {
     message,
     idempotencyKey,
-    model: config?.model?.trim() || "codex-mini-latest",
-    provider: config?.provider?.trim() || "openai",
   };
 
   const extraSystemPrompt = config?.systemPrompt?.trim();
@@ -363,6 +361,118 @@ function buildGatewayAgentParams(
   if (sessionKey) params.sessionKey = sessionKey;
 
   return params;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function firstMeaningfulString(...values: unknown[]): string {
+  for (const value of values) {
+    if (typeof value !== "string") continue;
+    const trimmed = value.trim();
+    if (!trimmed) continue;
+    if (/^(accepted|completed|ok)$/i.test(trimmed)) continue;
+    return trimmed;
+  }
+  return "";
+}
+
+function extractGatewayPayloadText(payload: unknown): string {
+  if (typeof payload === "string") {
+    return payload.trim();
+  }
+
+  if (!isRecord(payload)) {
+    return "";
+  }
+
+  const direct = firstMeaningfulString(payload.text, payload.content);
+  if (direct) {
+    return direct;
+  }
+
+  const content = payload.content;
+  if (Array.isArray(content)) {
+    const text = content
+      .map((item) => (isRecord(item) && typeof item.text === "string" ? item.text.trim() : ""))
+      .filter(Boolean)
+      .join("\n");
+    if (text) {
+      return text;
+    }
+  }
+
+  const parts = payload.parts;
+  if (Array.isArray(parts)) {
+    const text = parts
+      .map((item) => (isRecord(item) && typeof item.text === "string" ? item.text.trim() : ""))
+      .filter(Boolean)
+      .join("\n");
+    if (text) {
+      return text;
+    }
+  }
+
+  return "";
+}
+
+function extractGatewayPayloadTexts(
+  payloads: unknown[],
+  opts?: { includeErrors?: boolean }
+): string[] {
+  const texts: string[] = [];
+
+  for (const entry of payloads) {
+    if (isRecord(entry)) {
+      if (entry.isReasoning === true) continue;
+      if (!opts?.includeErrors && entry.isError === true) continue;
+    }
+
+    const text = extractGatewayPayloadText(entry);
+    if (text) {
+      texts.push(text);
+    }
+  }
+
+  return texts;
+}
+
+function extractAgentResponseText(payload: unknown, streamedText: string): string {
+  if (!isRecord(payload)) {
+    return streamedText.trim();
+  }
+
+  const result = isRecord(payload.result) ? payload.result : undefined;
+  const payloadGroups = [
+    Array.isArray(result?.payloads) ? result.payloads : [],
+    Array.isArray(result?.deliveryPayloads) ? result.deliveryPayloads : [],
+    Array.isArray(payload.payloads) ? payload.payloads : [],
+  ];
+
+  for (const group of payloadGroups) {
+    const texts = extractGatewayPayloadTexts(group);
+    if (texts.length > 0) {
+      return texts.join("\n\n").trim();
+    }
+  }
+
+  for (const group of payloadGroups) {
+    const texts = extractGatewayPayloadTexts(group, { includeErrors: true });
+    if (texts.length > 0) {
+      return texts.join("\n\n").trim();
+    }
+  }
+
+  return (
+    firstMeaningfulString(
+      result?.outputText,
+      result?.response,
+      payload.response,
+      result?.summary,
+      payload.summary
+    ) || streamedText.trim()
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -380,11 +490,17 @@ export async function sendMessageToOpenClaw(
   }
 
   const port = config?.gatewayPort ?? 18789;
-  const wsUrl = `ws://localhost:${port}`;
+  const wsUrl = `ws://127.0.0.1:${port}`;
 
   const clientId = GATEWAY_CLIENT_IDS.CONTROL_UI; // "openclaw-control-ui"
   const clientVersion = CLIENT_VERSION;
+  const clientMode = GATEWAY_CLIENT_MODES.WEBCHAT;
   const platform = typeof navigator !== "undefined" ? navigator.platform : "unknown";
+  const locale = typeof navigator !== "undefined" ? navigator.language || "zh-CN" : "zh-CN";
+  const userAgent =
+    typeof navigator !== "undefined"
+      ? navigator.userAgent || `${clientId}/${clientVersion}`
+      : `${clientId}/${clientVersion}`;
   const role = "operator";
   const scopes = ["operator.read", "operator.write", "operator.admin", "operator.approvals", "operator.pairing"];
 
@@ -396,15 +512,52 @@ export async function sendMessageToOpenClaw(
     let nonce: string | null = null;
     let pendingConnectErrorCode: string | null = null;
     let helloOkReceived = false;
+    let agentRequestId: string | null = null;
+    let agentRunId: string | null = null;
+    let agentStreamCompleted = false;
+    const connectRequestIds = new Set<string>();
     /** 本轮会话最后一次 connect 是 token-only 还是带 device（用于重试顺序） */
     let lastConnectKind: "no-device" | "device" | null = null;
     let handledChallengeNonce: string | null = null;
     let mismatchReconnectDone = false;
+    let initialConnectHandle: number | null = null;
+    let timeoutHandle: number | undefined;
+
+    const clearRequestTimeout = () => {
+      if (timeoutHandle !== undefined) {
+        window.clearTimeout(timeoutHandle);
+        timeoutHandle = undefined;
+      }
+    };
+
+    const armConnectTimeout = () => {
+      clearRequestTimeout();
+      timeoutHandle = window.setTimeout(() => {
+        if (!settled) {
+          settle({ success: false, error: "网关连接超时（15s）" });
+        }
+      }, 15000);
+    };
+
+    const armFinalTimeout = () => {
+      clearRequestTimeout();
+      timeoutHandle = window.setTimeout(() => {
+        if (!settled) {
+          settle({ success: false, error: "等待网关最终响应超时（120s）" });
+        }
+      }, 120000);
+    };
+
+    const armTimeout = armConnectTimeout;
 
     const settle = (result: { success: boolean; response?: string; error?: string }) => {
       if (settled) return;
       settled = true;
-      window.clearTimeout(timeoutHandle);
+      if (initialConnectHandle !== null) {
+        window.clearTimeout(initialConnectHandle);
+        initialConnectHandle = null;
+      }
+      clearRequestTimeout();
       ws?.close();
       resolve(result);
     };
@@ -414,20 +567,35 @@ export async function sendMessageToOpenClaw(
       return () => `req-${Date.now()}-${++counter}`;
     })();
 
-    let timeoutHandle = window.setTimeout(() => {
-      if (!settled) settle({ success: false, error: "网关连接超时（15s）" });
-    }, 15000);
+    const queueInitialConnect = () => {
+      if (initialConnectHandle !== null) {
+        window.clearTimeout(initialConnectHandle);
+      }
 
-    const armTimeout = () => {
-      window.clearTimeout(timeoutHandle);
-      timeoutHandle = window.setTimeout(() => {
-        if (!settled) settle({ success: false, error: "网关连接超时（15s）" });
-      }, 15000);
+      initialConnectHandle = window.setTimeout(() => {
+        initialConnectHandle = null;
+
+        if (
+          settled ||
+          helloOkReceived ||
+          lastConnectKind !== null ||
+          !ws ||
+          ws.readyState !== WebSocket.OPEN
+        ) {
+          return;
+        }
+
+        lastConnectKind = "no-device";
+        armConnectTimeout();
+        void sendConnectWithoutDevice();
+      }, 750);
     };
+
+    armConnectTimeout();
 
     const attachSocketHandlers = (socket: WebSocket) => {
       socket.onopen = () => {
-        // Gateway sends connect.challenge; we handle it in onmessage.
+        queueInitialConnect();
       };
 
       socket.onmessage = onMessage;
@@ -436,12 +604,19 @@ export async function sendMessageToOpenClaw(
     };
 
     function onError() {
-      window.clearTimeout(timeoutHandle);
-      if (!settled) settle({ success: false, error: "无法连接本地网关 WebSocket" });
+      clearRequestTimeout();
+      if (!settled) {
+        settle({ success: false, error: "无法连接本地网关 WebSocket" });
+        return;
+      }
     }
 
     function onClose(ev: CloseEvent) {
-      window.clearTimeout(timeoutHandle);
+      if (initialConnectHandle !== null) {
+        window.clearTimeout(initialConnectHandle);
+        initialConnectHandle = null;
+      }
+      clearRequestTimeout();
       if (settled) return;
 
       const reason = String(ev.reason || "");
@@ -453,6 +628,10 @@ export async function sendMessageToOpenClaw(
         handledChallengeNonce = null;
         lastConnectKind = null;
         nonce = null;
+        connectRequestIds.clear();
+        agentRequestId = null;
+        agentRunId = null;
+        agentStreamCompleted = false;
         armTimeout();
         const next = new WebSocket(wsUrl);
         ws = next;
@@ -460,20 +639,26 @@ export async function sendMessageToOpenClaw(
         return;
       }
 
-      if (accumulated) {
+      if (agentStreamCompleted && accumulated.trim()) {
         onStream?.("", true);
         settle({ success: true, response: accumulated });
       } else {
-        const detail =
-          mismatch || /device identity|identity mismatch/i.test(reason)
-            ? `（${reason || "device identity mismatch"}）`
-            : "";
+        const closeDetail = mismatch || /device identity|identity mismatch/i.test(reason)
+          ? `（${reason || "device identity mismatch"}）`
+          : "";
         settle({
           success: false,
-          error: `网关连接关闭（${ev.code}）${detail}`,
+          error: `网关连接关闭（${ev.code}）${closeDetail}`,
         });
+        return;
       }
     }
+
+    const matchesAgentRun = (payload: Record<string, unknown> | undefined) => {
+      if (!payload || !agentRunId) return true;
+      const runId = typeof payload.runId === "string" ? payload.runId.trim() : "";
+      return !runId || runId === agentRunId;
+    };
 
     async function onMessage(event: MessageEvent) {
       let frame: Record<string, unknown>;
@@ -487,6 +672,10 @@ export async function sendMessageToOpenClaw(
 
       // ── connect.challenge ──────────────────────────────────────────────────
       if (type === "event" && frame.event === "connect.challenge") {
+        if (initialConnectHandle !== null) {
+          window.clearTimeout(initialConnectHandle);
+          initialConnectHandle = null;
+        }
         const payload = frame.payload as Record<string, unknown> | undefined;
         nonce = typeof payload?.nonce === "string" && payload.nonce.trim().length > 0
           ? payload.nonce.trim()
@@ -522,6 +711,65 @@ export async function sendMessageToOpenClaw(
             };
           };
         };
+        const responseId = typeof resFrame.id === "string" ? resFrame.id : null;
+        const payload = isRecord(resFrame.payload) ? resFrame.payload : undefined;
+
+        if (responseId && connectRequestIds.has(responseId)) {
+          connectRequestIds.delete(responseId);
+        }
+
+        if (resFrame.ok && responseId && payload?.type === "hello-ok") {
+          helloOkReceived = true;
+          pendingConnectErrorCode = null;
+          const agentParams = buildGatewayAgentParams(message, config);
+          if (ws && ws.readyState === WebSocket.OPEN) {
+            const requestId = nextId();
+            agentRequestId = requestId;
+            agentRunId = null;
+            agentStreamCompleted = false;
+            ws.send(JSON.stringify({ type: "req", id: requestId, method: "agent", params: agentParams }));
+            armFinalTimeout();
+          } else {
+            settle({ success: false, error: "WebSocket disconnected before agent request was sent" });
+          }
+          return;
+        }
+
+        if (resFrame.ok && responseId && agentRequestId === responseId) {
+          const status = typeof payload?.status === "string" ? payload.status : "";
+          const runId = typeof payload?.runId === "string" ? payload.runId.trim() : "";
+
+          if (runId) {
+            agentRunId = runId;
+          }
+
+          if (status === "accepted") {
+            armFinalTimeout();
+            return;
+          }
+
+          const text = extractAgentResponseText(payload, accumulated);
+          if (text) {
+            accumulated = text;
+          }
+
+          if (status === "error") {
+            settle({ success: false, error: text || "Agent run failed" });
+            return;
+          }
+
+          onStream?.("", true);
+          settle({ success: true, response: accumulated || undefined });
+          return;
+        }
+
+        if (resFrame.ok && helloOkReceived) {
+          if (payload?.runId && typeof payload.runId === "string") {
+            agentRunId = payload.runId.trim() || agentRunId;
+          }
+          armFinalTimeout();
+          return;
+        }
 
         if (resFrame.ok) {
           // Check payload type to identify connect response
@@ -625,6 +873,65 @@ export async function sendMessageToOpenClaw(
       // ── Event frame ───────────────────────────────────────────────────────
       if (type === "event") {
         const ev = frame as { event: string; payload?: Record<string, unknown> };
+        const payload = isRecord(ev.payload) ? ev.payload : undefined;
+
+        if (!matchesAgentRun(payload)) {
+          return;
+        }
+
+        if (ev.event === "agent" || ev.event === "agent.text") {
+          const text = extractGatewayPayloadText(payload);
+          if (text) {
+            accumulated += text;
+            onStream?.(text, false);
+            armFinalTimeout();
+          }
+          const done = Boolean(payload?.done) || payload?.status === "completed";
+          if (done) {
+            agentStreamCompleted = true;
+            onStream?.("", true);
+            armFinalTimeout();
+          }
+          return;
+        }
+
+        if (ev.event === "chat") {
+          const p = payload as {
+            state?: string;
+            message?: unknown;
+            errorMessage?: string;
+          } | undefined;
+          if (p?.state === "delta" && p.message != null) {
+            const m = p.message;
+            let chunk = "";
+            if (typeof m === "string") chunk = m;
+            else if (m && typeof m === "object" && "content" in m) {
+              const c = (m as { content?: unknown }).content;
+              if (typeof c === "string") chunk = c;
+            }
+            if (chunk) {
+              accumulated += chunk;
+              onStream?.(chunk, false);
+              armFinalTimeout();
+            }
+          }
+          if (p?.state === "final") {
+            agentStreamCompleted = true;
+            onStream?.("", true);
+            armFinalTimeout();
+          }
+          if (p?.state === "error") {
+            settle({ success: false, error: p.errorMessage || "网关 chat 错误" });
+          }
+          return;
+        }
+
+        if (ev.event === "agent.done") {
+          agentStreamCompleted = true;
+          onStream?.("", true);
+          armFinalTimeout();
+          return;
+        }
 
         if (ev.event === "agent" || ev.event === "agent.text") {
           const p = ev.payload;
@@ -705,7 +1012,7 @@ export async function sendMessageToOpenClaw(
       const payload = buildDeviceAuthPayloadV3({
         deviceId: deviceIdentity.deviceId,
         clientId,
-        clientMode: "ui",
+        clientMode,
         role,
         scopes,
         signedAtMs,
@@ -723,7 +1030,7 @@ export async function sendMessageToOpenClaw(
           id: clientId,
           version: clientVersion,
           platform,
-          mode: "ui",
+          mode: clientMode,
         },
         caps: ["tool-events"],
         commands: [],
@@ -731,8 +1038,8 @@ export async function sendMessageToOpenClaw(
         role,
         scopes,
         auth: { token: authToken },
-        locale: "zh-CN",
-        userAgent: `${clientId}/${clientVersion}`,
+        locale,
+        userAgent,
         device: {
           id: deviceIdentity.deviceId,
           publicKey: deviceIdentity.publicKey,
@@ -752,7 +1059,7 @@ export async function sendMessageToOpenClaw(
           id: clientId,
           version: clientVersion,
           platform,
-          mode: "ui",
+          mode: clientMode,
         },
         caps: ["tool-events"],
         commands: [],
@@ -760,8 +1067,8 @@ export async function sendMessageToOpenClaw(
         role,
         scopes,
         auth: { token: authToken },
-        locale: "zh-CN",
-        userAgent: `${clientId}/${clientVersion}`,
+        locale,
+        userAgent,
       };
     }
 
@@ -769,19 +1076,25 @@ export async function sendMessageToOpenClaw(
       const params = await buildDeviceConnectParams();
       if (!params) {
         lastConnectKind = "no-device";
-        sendConnectWithoutDevice();
+        void sendConnectWithoutDevice();
         return;
       }
       lastConnectKind = "device";
       if (ws && ws.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify({ type: "req", id: nextId(), method: "connect", params }));
+        const requestId = nextId();
+        connectRequestIds.add(requestId);
+        armConnectTimeout();
+        ws.send(JSON.stringify({ type: "req", id: requestId, method: "connect", params }));
       }
     }
 
     async function sendConnectWithoutDevice() {
       const params = buildNoDeviceConnectParams();
       if (ws && ws.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify({ type: "req", id: nextId(), method: "connect", params }));
+        const requestId = nextId();
+        connectRequestIds.add(requestId);
+        armConnectTimeout();
+        ws.send(JSON.stringify({ type: "req", id: requestId, method: "connect", params }));
       }
     }
   });
