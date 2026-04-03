@@ -4,6 +4,7 @@ import { listen } from "@tauri-apps/api/event";
 import { ConsoleShell } from "@/components/ConsoleShell";
 import { EnvironmentCheck } from "@/components/EnvironmentCheck";
 import { Onboarding } from "@/components/Onboarding";
+import { DEFAULT_MODEL, DEFAULT_PROVIDER, resolveBaseUrl } from "@/lib/models";
 import { TitleBar } from "@/components/TitleBar";
 import { isIgnorableTauriInvokeError } from "@/lib/tauriErrors";
 import { type OpenClawConfig, useAppStore } from "@/store/appStore";
@@ -182,6 +183,7 @@ async function detectBootConfigOnce(): Promise<BootOutcome> {
       payload.is_setup_complete === true ||
       payload.isSetupComplete === true;
     const hasValidKey = Boolean(apiKey || baseUrl);
+    const normalizedProvider = provider ?? DEFAULT_PROVIDER;
 
     if (!found && !hasValidKey) {
       console.log("底层确认无配置，进入向导");
@@ -194,9 +196,9 @@ async function detectBootConfigOnce(): Promise<BootOutcome> {
       mappedConfig: {
         installed: true,
         apiKey,
-        baseUrl,
-        model: model ?? "codex-mini-latest",
-        provider: provider ?? "openai",
+        baseUrl: resolveBaseUrl(normalizedProvider, baseUrl),
+        model: model ?? DEFAULT_MODEL,
+        provider: normalizedProvider,
         systemPrompt,
         temperature,
         maxTokens,

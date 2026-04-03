@@ -2,7 +2,15 @@ import { useEffect, useMemo, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { LoaderCircle, Sparkles } from "lucide-react";
 import { Button } from "@/components/ui";
-import { PROVIDERS, PROVIDER_MODELS } from "@/lib/models";
+import {
+  DEFAULT_MODEL,
+  DEFAULT_PROVIDER,
+  PROVIDERS,
+  getDefaultModelForProvider,
+  getProviderBaseUrl,
+  getProviderModels,
+  resolveBaseUrl,
+} from "@/lib/models";
 import { isIgnorableTauriInvokeError } from "@/lib/tauriErrors";
 import { type OpenClawConfig, useAppStore } from "@/store/appStore";
 
@@ -35,14 +43,15 @@ function readStringField(
 export function Onboarding({ onComplete }: OnboardingProps) {
   const { openclaw, setOpenClawConfig } = useAppStore();
 
-  const [provider, setProvider] = useState(openclaw.provider ?? "openai");
-  const [model, setModel] = useState(openclaw.model ?? "codex-mini-latest");
+  const [provider, setProvider] = useState(openclaw.provider ?? DEFAULT_PROVIDER);
+  const [model, setModel] = useState(openclaw.model ?? DEFAULT_MODEL);
   const [apiKey, setApiKey] = useState(openclaw.apiKey ?? "");
-  const [baseUrl, setBaseUrl] = useState(openclaw.baseUrl ?? "");
+  const [baseUrl, setBaseUrl] = useState(
+    resolveBaseUrl(openclaw.provider ?? DEFAULT_PROVIDER, openclaw.baseUrl)
+  );
   const [customName, setCustomName] = useState(openclaw.customName ?? "SelfClaw");
   const [detectedConfig, setDetectedConfig] = useState<Partial<OpenClawConfig> | null>(null);
   const [isDetecting, setIsDetecting] = useState(true);
-  const [showSkipHint, setShowSkipHint] = useState(false);
 
   useEffect(() => {
     let isMounted = true;
@@ -86,19 +95,23 @@ export function Onboarding({ onComplete }: OnboardingProps) {
           return;
         }
 
+        const normalizedProvider = nextProvider ?? openclaw.provider ?? DEFAULT_PROVIDER;
+        const normalizedModel =
+          nextModel ?? openclaw.model ?? getDefaultModelForProvider(normalizedProvider);
+
         const parsedConfig: Partial<OpenClawConfig> = {
           installed: true,
           apiKey: nextApiKey,
-          baseUrl: nextBaseUrl,
-          model: nextModel ?? openclaw.model ?? "codex-mini-latest",
-          provider: nextProvider ?? openclaw.provider ?? "openai",
+          baseUrl: resolveBaseUrl(normalizedProvider, nextBaseUrl ?? openclaw.baseUrl),
+          model: normalizedModel,
+          provider: normalizedProvider,
         };
 
         setDetectedConfig(parsedConfig);
-        setProvider(parsedConfig.provider ?? "openai");
-        setModel(parsedConfig.model ?? "codex-mini-latest");
+        setProvider(parsedConfig.provider ?? DEFAULT_PROVIDER);
+        setModel(parsedConfig.model ?? DEFAULT_MODEL);
         setApiKey(parsedConfig.apiKey ?? "");
-        setBaseUrl(parsedConfig.baseUrl ?? "");
+        setBaseUrl(resolveBaseUrl(parsedConfig.provider, parsedConfig.baseUrl));
       })
       .catch((error) => {
         if (!isMounted) {
@@ -120,10 +133,10 @@ export function Onboarding({ onComplete }: OnboardingProps) {
     return () => {
       isMounted = false;
     };
-  }, [openclaw.model, openclaw.provider]);
+  }, [openclaw.baseUrl, openclaw.model, openclaw.provider]);
 
   const availableModels = useMemo(() => {
-    return PROVIDER_MODELS[provider] ?? [];
+    return getProviderModels(provider);
   }, [provider]);
 
   const disableForm = Boolean(detectedConfig);
@@ -136,7 +149,7 @@ export function Onboarding({ onComplete }: OnboardingProps) {
           model: config.model,
           defaultModel: config.model,
           apiKey: config.apiKey ?? "",
-          baseUrl: config.baseUrl ?? "",
+          baseUrl: resolveBaseUrl(config.provider, config.baseUrl),
           customName: config.customName ?? "SelfClaw",
         },
       });
@@ -153,7 +166,7 @@ export function Onboarding({ onComplete }: OnboardingProps) {
       provider,
       model,
       apiKey: apiKey.trim(),
-      baseUrl: baseUrl.trim(),
+      baseUrl: resolveBaseUrl(provider, baseUrl),
       customName: customName.trim(),
     };
     setOpenClawConfig(config);
@@ -171,7 +184,10 @@ export function Onboarding({ onComplete }: OnboardingProps) {
       provider: detectedConfig.provider ?? provider,
       model: detectedConfig.model ?? model,
       apiKey: (detectedConfig.apiKey ?? apiKey).trim(),
-      baseUrl: (detectedConfig.baseUrl ?? baseUrl).trim(),
+      baseUrl: resolveBaseUrl(
+        detectedConfig.provider ?? provider,
+        detectedConfig.baseUrl ?? baseUrl
+      ),
       customName: customName.trim(),
     };
     setOpenClawConfig(config);
@@ -189,7 +205,7 @@ export function Onboarding({ onComplete }: OnboardingProps) {
       provider,
       model,
       apiKey: apiKey.trim(),
-      baseUrl: baseUrl.trim(),
+      baseUrl: resolveBaseUrl(provider, baseUrl),
       customName: customName.trim(),
     };
     setOpenClawConfig(config);
@@ -236,10 +252,8 @@ export function Onboarding({ onComplete }: OnboardingProps) {
               onChange={(event) => {
                 const nextProvider = event.target.value;
                 setProvider(nextProvider);
-                const defaultModel = PROVIDER_MODELS[nextProvider]?.[0]?.id;
-                if (defaultModel) {
-                  setModel(defaultModel);
-                }
+                setModel(getDefaultModelForProvider(nextProvider));
+                setBaseUrl(getProviderBaseUrl(nextProvider));
               }}
               className={controlClass}
             >
@@ -258,7 +272,10 @@ export function Onboarding({ onComplete }: OnboardingProps) {
             <select
               value={model}
               disabled={disableForm}
-              onChange={(event) => setModel(event.target.value)}
+              onChange={(event) => {
+                setModel(event.target.value);
+                setBaseUrl((current) => current.trim() || getProviderBaseUrl(provider));
+              }}
               className={controlClass}
             >
               {availableModels.map((item) => (
@@ -291,9 +308,12 @@ export function Onboarding({ onComplete }: OnboardingProps) {
               value={baseUrl}
               disabled={disableForm}
               onChange={(event) => setBaseUrl(event.target.value)}
-              placeholder="https://api.openai.com/v1"
+              placeholder={getProviderBaseUrl(provider)}
               className={controlClass}
             />
+            <p className="text-xs text-neutral-500">
+              根据提供商自动填充默认地址，必要时可自行改成兼容端点。
+            </p>
           </div>
 
           <div className="space-y-2 sm:col-span-2">

@@ -1,5 +1,6 @@
 import { create } from "zustand";
 import { createJSONStorage, persist } from "zustand/middleware";
+import { DEFAULT_MODEL, DEFAULT_PROVIDER, getProviderBaseUrl } from "@/lib/models";
 import { indexedDbStorage } from "@/store/indexedDbStorage";
 
 export interface Message {
@@ -45,9 +46,10 @@ export interface OpenClawConfig {
 // 默认配置
 const DEFAULT_OPENCLAW_CONFIG: OpenClawConfig = {
   installed: false,
-  provider: "openai",
-  model: "codex-mini-latest",
-  defaultModel: "codex-mini-latest",
+  provider: DEFAULT_PROVIDER,
+  model: DEFAULT_MODEL,
+  defaultModel: DEFAULT_MODEL,
+  baseUrl: getProviderBaseUrl(DEFAULT_PROVIDER),
   systemPrompt: "",
   temperature: 1,
   maxTokens: 4096,
@@ -298,6 +300,10 @@ export const useAppStore = create<AppState>()(
         if (state.openclaw && typeof state.openclaw === "object") {
           delete state.openclaw.apiKey;
           state.openclaw = { ...DEFAULT_OPENCLAW_CONFIG, ...state.openclaw };
+          state.openclaw.baseUrl =
+            typeof state.openclaw.baseUrl === "string" && state.openclaw.baseUrl.trim()
+              ? state.openclaw.baseUrl.trim()
+              : getProviderBaseUrl(state.openclaw.provider);
           if (
             typeof state.openclaw.gatewayPort !== "number" ||
             !Number.isFinite(state.openclaw.gatewayPort) ||

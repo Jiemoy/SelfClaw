@@ -2,6 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::fs;
 use std::net::{SocketAddr, TcpStream};
@@ -192,6 +193,10 @@ fn openclaw_workspace_dir() -> PathBuf {
 
 fn selfclaw_ui_config_path() -> PathBuf {
     openclaw_workspace_dir().join("selfclaw-ui.json")
+}
+
+fn clawhub_skills_dir() -> PathBuf {
+    openclaw_workspace_dir().join("skills")
 }
 
 #[cfg(target_os = "windows")]
@@ -2555,6 +2560,886 @@ async fn parse_dropped_file(file_name: String, content: String) -> Result<Droppe
     })
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ClawHubSkillInstallProgress {
+    progress: u8,
+    stage: String,
+    slug: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ClawHubSkillInstallResult {
+    slug: String,
+    installed_dir: String,
+    source_url: String,
+    download_url: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ClawHubSkillMetaFile {
+    slug: String,
+    version: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct InstalledClawHubSkillMeta {
+    name: String,
+    slug: String,
+    installed_version: Option<String>,
+    installed_dir: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ClawHubSkillUpdateCheckInput {
+    slug: String,
+    installed_version: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ClawHubSkillUpdateInfo {
+    slug: String,
+    installed_version: Option<String>,
+    latest_version: Option<String>,
+    update_available: bool,
+    source_url: String,
+    download_url: Option<String>,
+    message: Option<String>,
+}
+
+#[derive(Debug)]
+struct ResolvedClawHubSkillSource {
+    slug: String,
+    source_url: String,
+    download_url: String,
+}
+
+#[derive(Debug)]
+struct ClawHubRemoteReleaseInfo {
+    source_url: String,
+    download_url: String,
+    latest_version: Option<String>,
+}
+
+fn emit_clawhub_skill_install_progress(
+    app: &AppHandle,
+    progress: u8,
+    stage: impl Into<String>,
+    slug: Option<&str>,
+) {
+    let _ = app.emit(
+        "clawhub-skill-install-progress",
+        ClawHubSkillInstallProgress {
+            progress,
+            stage: stage.into(),
+            slug: slug.map(|value| value.to_string()),
+        },
+    );
+}
+
+fn extract_url_host(url: &str) -> Option<String> {
+    let rest = url.split("://").nth(1)?;
+    let authority = rest.split('/').next().unwrap_or(rest);
+    let host = authority.rsplit('@').next().unwrap_or(authority);
+    Some(host.split(':').next().unwrap_or(host).to_ascii_lowercase())
+}
+
+fn extract_url_path(url: &str) -> &str {
+    let Some(rest) = url.split("://").nth(1) else {
+        return "";
+    };
+    let Some(path_start) = rest.find('/') else {
+        return "";
+    };
+
+    let path = &rest[path_start..];
+    path.split('?')
+        .next()
+        .unwrap_or(path)
+        .split('#')
+        .next()
+        .unwrap_or(path)
+}
+
+fn extract_query_param(url: &str, key: &str) -> Option<String> {
+    let (_, query) = url.split_once('?')?;
+    let query = query.split('#').next().unwrap_or(query);
+    for pair in query.split('&') {
+        let (name, value) = pair.split_once('=').unwrap_or((pair, ""));
+        if name == key && !value.trim().is_empty() {
+            return Some(value.trim().replace('+', " "));
+        }
+    }
+    None
+}
+
+fn sanitize_skill_slug(raw: &str) -> Result<String, String> {
+    let trimmed = raw.trim().trim_matches('/');
+    if trimmed.is_empty() {
+        return Err("未识别到技能名称，请粘贴技能页链接、下载链接或技能名。".to_string());
+    }
+
+    if trimmed.contains(['\\', '/']) {
+        return Err(format!("技能名称 `{}` 格式无效。", trimmed));
+    }
+
+    if !trimmed
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
+    {
+        return Err(format!("技能名称 `{}` 含有不支持的字符。", trimmed));
+    }
+
+    Ok(trimmed.to_string())
+}
+
+fn format_byte_size(bytes: u64) -> String {
+    if bytes < 1024 {
+        format!("{} B", bytes)
+    } else if bytes < 1024 * 1024 {
+        format!("{:.1} KB", bytes as f64 / 1024.0)
+    } else {
+        format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
+    }
+}
+
+fn extract_skill_target_from_input(input: &str) -> Result<String, String> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Err("请输入技能页链接、下载链接或技能名。".to_string());
+    }
+
+    let tokens: Vec<&str> = trimmed.split_whitespace().collect();
+    let normalized = if tokens
+        .first()
+        .map(|token| token.eq_ignore_ascii_case("openclaw"))
+        .unwrap_or(false)
+    {
+        &tokens[1..]
+    } else {
+        &tokens[..]
+    };
+
+    if normalized.len() >= 2
+        && normalized[0].eq_ignore_ascii_case("skills")
+        && normalized[1].eq_ignore_ascii_case("install")
+    {
+        let mut index = 2usize;
+        while index < normalized.len() {
+            let token = normalized[index];
+            if !token.starts_with('-') {
+                return Ok(token.to_string());
+            }
+
+            if token == "--version" || token == "--marketplace" {
+                index += 2;
+            } else {
+                index += 1;
+            }
+        }
+
+        return Err("没有从安装命令里识别到技能名称。".to_string());
+    }
+
+    if normalized.len() >= 2
+        && normalized[0].eq_ignore_ascii_case("plugins")
+        && normalized[1].eq_ignore_ascii_case("install")
+    {
+        return Err("这是插件安装命令，请在插件安装流程里处理。".to_string());
+    }
+
+    Ok(trimmed.to_string())
+}
+
+fn absolutize_clawhub_href(href: &str) -> String {
+    if href.starts_with("http://") || href.starts_with("https://") {
+        href.to_string()
+    } else if href.starts_with("//") {
+        format!("https:{}", href)
+    } else if href.starts_with('/') {
+        format!("https://clawhub.ai{}", href)
+    } else {
+        format!("https://clawhub.ai/{}", href.trim_start_matches("./"))
+    }
+}
+
+fn extract_clawhub_download_href(html: &str) -> Option<String> {
+    for (needle, quote) in [("href=\"", '"'), ("href='", '\'')] {
+        let mut search_start = 0usize;
+        while let Some(relative_index) = html[search_start..].find(needle) {
+            let href_start = search_start + relative_index + needle.len();
+            let remainder = &html[href_start..];
+            let Some(href_end) = remainder.find(quote) else {
+                break;
+            };
+
+            let href = remainder[..href_end].replace("&amp;", "&");
+            if href.contains("/api/v1/download?slug=") {
+                return Some(absolutize_clawhub_href(&href));
+            }
+
+            search_start = href_start + href_end + 1;
+        }
+    }
+
+    None
+}
+
+fn extract_clawhub_latest_version(html: &str) -> Option<String> {
+    if let Some(og_index) = html.find("/og/skill.png") {
+        let tail = &html[og_index..];
+        if let Some(version_index) = tail.find("version=") {
+            let value = &tail[version_index + "version=".len()..];
+            let end_index = value
+                .find(|ch| matches!(ch, '&' | '"' | '\'' | '<'))
+                .unwrap_or(value.len());
+            let version = value[..end_index].trim();
+            if !version.is_empty() {
+                return Some(version.to_string());
+            }
+        }
+    }
+
+    let badge_prefix = "plugin-version-badge\">v<!-- -->";
+    if let Some(index) = html.find(badge_prefix) {
+        let tail = &html[index + badge_prefix.len()..];
+        let end_index = tail.find('<').unwrap_or(tail.len());
+        let version = tail[..end_index].trim();
+        if !version.is_empty() {
+            return Some(version.to_string());
+        }
+    }
+
+    let latest_prefix = "version:\"";
+    if let Some(index) = html.find(latest_prefix) {
+        let tail = &html[index + latest_prefix.len()..];
+        let end_index = tail.find('"').unwrap_or(tail.len());
+        let version = tail[..end_index].trim();
+        if !version.is_empty() {
+            return Some(version.to_string());
+        }
+    }
+
+    None
+}
+
+fn fetch_clawhub_skill_page_html(page_url: &str) -> Result<String, String> {
+    let response = ureq::get(page_url)
+        .call()
+        .map_err(|error| format!("打开技能页面失败：{}", error))?;
+    let mut html = String::new();
+    let mut reader = response.into_reader();
+    std::io::Read::read_to_string(&mut reader, &mut html)
+        .map_err(|error| format!("读取技能页面内容失败：{}", error))?;
+    Ok(html)
+}
+
+fn discover_clawhub_download_url(page_url: &str) -> Result<String, String> {
+    let html = fetch_clawhub_skill_page_html(page_url)?;
+
+    extract_clawhub_download_href(&html)
+        .ok_or_else(|| "没有在技能页面里找到 Download zip 链接，请确认粘贴的是技能详情页。".to_string())
+}
+
+fn fetch_clawhub_remote_release(slug: &str) -> Result<ClawHubRemoteReleaseInfo, String> {
+    let sanitized_slug = sanitize_skill_slug(slug)?;
+    let source_url = format!("https://clawhub.ai/skills/{}", sanitized_slug);
+    let html = fetch_clawhub_skill_page_html(&source_url)?;
+    let download_url = extract_clawhub_download_href(&html)
+        .ok_or_else(|| "没有在技能页面里找到 Download zip 链接，请稍后再试。".to_string())?;
+
+    Ok(ClawHubRemoteReleaseInfo {
+        source_url,
+        download_url,
+        latest_version: extract_clawhub_latest_version(&html),
+    })
+}
+
+fn version_parts(value: &str) -> Vec<&str> {
+    value
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .filter(|part| !part.is_empty())
+        .collect()
+}
+
+fn compare_versions(left: &str, right: &str) -> Ordering {
+    let left_parts = version_parts(left);
+    let right_parts = version_parts(right);
+    let max_len = left_parts.len().max(right_parts.len());
+
+    for index in 0..max_len {
+        let left_part = left_parts.get(index).copied().unwrap_or("0");
+        let right_part = right_parts.get(index).copied().unwrap_or("0");
+
+        let ordering = match (left_part.parse::<u64>(), right_part.parse::<u64>()) {
+            (Ok(left_number), Ok(right_number)) => left_number.cmp(&right_number),
+            _ => left_part.cmp(right_part),
+        };
+
+        if ordering != Ordering::Equal {
+            return ordering;
+        }
+    }
+
+    Ordering::Equal
+}
+
+fn read_skill_display_name(skill_root: &Path) -> Option<String> {
+    let skill_md_path = skill_root.join("SKILL.md");
+    let content = fs::read_to_string(skill_md_path).ok()?;
+    extract_skill_name_from_frontmatter(&content)
+}
+
+fn load_clawhub_skill_meta_from_dir(skill_dir: &Path) -> Result<ClawHubSkillMetaFile, String> {
+    let meta_path = skill_dir.join("_meta.json");
+    let content = fs::read_to_string(&meta_path)
+        .map_err(|error| format!("读取技能元数据 {} 失败：{}", meta_path.display(), error))?;
+    serde_json::from_str::<ClawHubSkillMetaFile>(&content)
+        .map_err(|error| format!("解析技能元数据 {} 失败：{}", meta_path.display(), error))
+}
+
+fn list_installed_clawhub_skills_sync() -> Result<Vec<InstalledClawHubSkillMeta>, String> {
+    let skills_dir = clawhub_skills_dir();
+    if !skills_dir.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut installed = Vec::new();
+    let entries = fs::read_dir(&skills_dir)
+        .map_err(|error| format!("读取技能目录 {} 失败：{}", skills_dir.display(), error))?;
+
+    for entry in entries {
+        let entry = entry.map_err(|error| format!("读取目录条目失败：{}", error))?;
+        let skill_dir = entry.path();
+        if !skill_dir.is_dir() {
+            continue;
+        }
+
+        if !skill_dir.join("_meta.json").is_file() {
+            continue;
+        }
+
+        let meta = match load_clawhub_skill_meta_from_dir(&skill_dir) {
+            Ok(meta) => meta,
+            Err(_) => continue,
+        };
+
+        let fallback_name = entry.file_name().to_string_lossy().to_string();
+        let name = read_skill_display_name(&skill_dir).unwrap_or(fallback_name);
+
+        installed.push(InstalledClawHubSkillMeta {
+            name,
+            slug: meta.slug,
+            installed_version: meta.version.and_then(|value| {
+                let trimmed = value.trim().to_string();
+                if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(trimmed)
+                }
+            }),
+            installed_dir: skill_dir.to_string_lossy().to_string(),
+        });
+    }
+
+    installed.sort_by(|left, right| left.name.cmp(&right.name));
+    Ok(installed)
+}
+
+fn check_clawhub_skill_updates_sync(
+    inputs: Vec<ClawHubSkillUpdateCheckInput>,
+) -> Result<Vec<ClawHubSkillUpdateInfo>, String> {
+    let mut results = Vec::with_capacity(inputs.len());
+
+    for input in inputs {
+        let sanitized_slug = match sanitize_skill_slug(&input.slug) {
+            Ok(slug) => slug,
+            Err(message) => {
+                results.push(ClawHubSkillUpdateInfo {
+                    slug: input.slug,
+                    installed_version: input.installed_version,
+                    latest_version: None,
+                    update_available: false,
+                    source_url: String::new(),
+                    download_url: None,
+                    message: Some(message),
+                });
+                continue;
+            }
+        };
+
+        match fetch_clawhub_remote_release(&sanitized_slug) {
+            Ok(remote) => {
+                let update_available = match (
+                    input.installed_version.as_deref(),
+                    remote.latest_version.as_deref(),
+                ) {
+                    (Some(installed_version), Some(latest_version)) => {
+                        compare_versions(latest_version, installed_version) == Ordering::Greater
+                    }
+                    _ => false,
+                };
+
+                results.push(ClawHubSkillUpdateInfo {
+                    slug: sanitized_slug,
+                    installed_version: input.installed_version,
+                    latest_version: remote.latest_version,
+                    update_available,
+                    source_url: remote.source_url,
+                    download_url: Some(remote.download_url),
+                    message: None,
+                });
+            }
+            Err(message) => {
+                results.push(ClawHubSkillUpdateInfo {
+                    slug: sanitized_slug,
+                    installed_version: input.installed_version,
+                    latest_version: None,
+                    update_available: false,
+                    source_url: String::new(),
+                    download_url: None,
+                    message: Some(message),
+                });
+            }
+        }
+    }
+
+    Ok(results)
+}
+
+fn resolve_clawhub_skill_source(input: &str) -> Result<ResolvedClawHubSkillSource, String> {
+    let candidate = extract_skill_target_from_input(input)?;
+
+    if candidate.contains("/plugins/") || candidate.starts_with("clawhub:") {
+        return Err("这是插件内容，请改用插件安装方式。".to_string());
+    }
+
+    if candidate.contains("/api/v1/download?slug=") {
+        let slug = extract_query_param(&candidate, "slug")
+            .ok_or_else(|| "下载链接里没有技能标识，无法继续安装。".to_string())?;
+        let slug = sanitize_skill_slug(&slug)?;
+        return Ok(ResolvedClawHubSkillSource {
+            slug,
+            source_url: candidate.clone(),
+            download_url: candidate,
+        });
+    }
+
+    if candidate.starts_with("http://") || candidate.starts_with("https://") {
+        let host = extract_url_host(&candidate).unwrap_or_default();
+        if host == "clawhub.ai" || host.ends_with(".clawhub.ai") {
+            let segments: Vec<&str> = extract_url_path(&candidate)
+                .split('/')
+                .filter(|segment| !segment.trim().is_empty())
+                .collect();
+            if segments.len() < 2 {
+                return Err("请粘贴具体的技能详情页链接，而不是商店列表页。".to_string());
+            }
+            if segments.first().copied() == Some("plugins") {
+                return Err("这是插件页面，请改用插件安装方式。".to_string());
+            }
+
+            let slug = segments
+                .last()
+                .copied()
+                .ok_or_else(|| "没有从链接中识别到技能名。".to_string())?;
+            let slug = sanitize_skill_slug(slug)?;
+            let download_url = discover_clawhub_download_url(&candidate)?;
+            return Ok(ResolvedClawHubSkillSource {
+                slug,
+                source_url: candidate,
+                download_url,
+            });
+        }
+
+        return Err("这里只支持 ClawHub 技能页链接、Download zip 链接或技能名。".to_string());
+    }
+
+    if candidate.contains(char::is_whitespace) {
+        return Err("请直接粘贴技能页链接、下载链接、安装命令或单独的技能名。".to_string());
+    }
+
+    let slug = sanitize_skill_slug(&candidate)?;
+    let source_url = format!("https://clawhub.ai/skills/{}", slug);
+    let download_url = discover_clawhub_download_url(&source_url)?;
+    Ok(ResolvedClawHubSkillSource {
+        slug,
+        source_url,
+        download_url,
+    })
+}
+
+fn download_clawhub_skill_archive(
+    app: &AppHandle,
+    url: &str,
+    output_path: &Path,
+    slug: &str,
+) -> Result<(), String> {
+    let response = ureq::get(url)
+        .call()
+        .map_err(|error| format!("下载技能包失败：{}", error))?;
+    let total_bytes = response
+        .header("content-length")
+        .and_then(|value| value.parse::<u64>().ok());
+
+    let mut reader = response.into_reader();
+    let mut file = fs::File::create(output_path)
+        .map_err(|error| format!("创建下载文件 {} 失败：{}", output_path.display(), error))?;
+
+    let mut buffer = [0u8; 65_536];
+    let mut downloaded = 0u64;
+    let mut last_progress = 19u8;
+
+    loop {
+        let bytes_read = std::io::Read::read(&mut reader, &mut buffer)
+            .map_err(|error| format!("读取下载流失败：{}", error))?;
+        if bytes_read == 0 {
+            break;
+        }
+
+        std::io::Write::write_all(&mut file, &buffer[..bytes_read])
+            .map_err(|error| format!("写入下载文件失败：{}", error))?;
+        downloaded += bytes_read as u64;
+
+        let progress = if let Some(total) = total_bytes.filter(|total| *total > 0) {
+            let ratio = downloaded as f64 / total as f64;
+            20u8.saturating_add((ratio * 50.0).round() as u8).min(70)
+        } else {
+            45
+        };
+
+        if progress > last_progress {
+            last_progress = progress;
+            let stage = if let Some(total) = total_bytes {
+                format!(
+                    "正在下载技能包 {}/{}",
+                    format_byte_size(downloaded),
+                    format_byte_size(total)
+                )
+            } else {
+                format!("正在下载技能包 {}", format_byte_size(downloaded))
+            };
+            emit_clawhub_skill_install_progress(app, progress, stage, Some(slug));
+        }
+    }
+
+    let final_size = fs::metadata(output_path)
+        .map_err(|error| format!("读取下载文件信息失败：{}", error))?
+        .len();
+    if final_size == 0 {
+        return Err("下载完成，但技能包为空。".to_string());
+    }
+
+    Ok(())
+}
+
+fn extract_zip_archive(zip_path: &Path, output_dir: &Path) -> Result<(), String> {
+    let file = fs::File::open(zip_path)
+        .map_err(|error| format!("打开技能压缩包 {} 失败：{}", zip_path.display(), error))?;
+    let mut archive =
+        zip::ZipArchive::new(file).map_err(|error| format!("读取技能压缩包失败：{}", error))?;
+
+    for index in 0..archive.len() {
+        let mut entry = archive
+            .by_index(index)
+            .map_err(|error| format!("读取压缩包条目失败：{}", error))?;
+        let enclosed_path = entry
+            .enclosed_name()
+            .map(|path| path.to_path_buf())
+            .ok_or_else(|| format!("压缩包内存在不安全路径：{}", entry.name()))?;
+        let destination = output_dir.join(enclosed_path);
+
+        if entry.is_dir() {
+            fs::create_dir_all(&destination)
+                .map_err(|error| format!("创建解压目录 {} 失败：{}", destination.display(), error))?;
+            continue;
+        }
+
+        if let Some(parent) = destination.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|error| format!("创建解压目录 {} 失败：{}", parent.display(), error))?;
+        }
+
+        let mut output = fs::File::create(&destination)
+            .map_err(|error| format!("创建解压文件 {} 失败：{}", destination.display(), error))?;
+        std::io::copy(&mut entry, &mut output)
+            .map_err(|error| format!("解压文件 {} 失败：{}", destination.display(), error))?;
+
+        #[cfg(unix)]
+        if let Some(mode) = entry.unix_mode() {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(&destination, fs::Permissions::from_mode(mode));
+        }
+    }
+
+    Ok(())
+}
+
+fn find_skill_root_dir(root: &Path) -> Result<PathBuf, String> {
+    if root.join("SKILL.md").is_file() {
+        return Ok(root.to_path_buf());
+    }
+
+    let mut stack = vec![root.to_path_buf()];
+    let mut candidates = Vec::<PathBuf>::new();
+
+    while let Some(dir) = stack.pop() {
+        let entries = fs::read_dir(&dir)
+            .map_err(|error| format!("读取解压目录 {} 失败：{}", dir.display(), error))?;
+
+        for entry in entries {
+            let entry = entry.map_err(|error| format!("读取目录条目失败：{}", error))?;
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+
+            if path.join("SKILL.md").is_file() {
+                candidates.push(path);
+            } else {
+                stack.push(path);
+            }
+        }
+    }
+
+    if candidates.is_empty() {
+        return Err("技能包里没有找到 SKILL.md，无法识别为有效技能。".to_string());
+    }
+
+    candidates.sort_by_key(|path| path.components().count());
+    let shortest_depth = candidates[0].components().count();
+    let same_depth_count = candidates
+        .iter()
+        .take_while(|path| path.components().count() == shortest_depth)
+        .count();
+
+    if same_depth_count > 1 {
+        return Err("技能包里识别到了多个技能目录，暂时无法自动安装。".to_string());
+    }
+
+    Ok(candidates.remove(0))
+}
+
+fn extract_skill_name_from_frontmatter(skill_md_content: &str) -> Option<String> {
+    let mut lines = skill_md_content.lines();
+    if lines.next()?.trim() != "---" {
+        return None;
+    }
+
+    for line in lines {
+        let trimmed = line.trim();
+        if trimmed == "---" {
+            break;
+        }
+
+        if let Some(value) = trimmed.strip_prefix("name:") {
+            let name = value.trim().trim_matches('"').trim_matches('\'').trim();
+            if !name.is_empty() {
+                return Some(name.to_string());
+            }
+        }
+    }
+
+    None
+}
+
+fn derive_skill_install_dir_name(skill_root: &Path, fallback_slug: &str) -> String {
+    let skill_md_path = skill_root.join("SKILL.md");
+    if let Ok(content) = fs::read_to_string(skill_md_path) {
+        if let Some(name) = extract_skill_name_from_frontmatter(&content) {
+            if let Ok(valid_name) = sanitize_skill_slug(&name) {
+                return valid_name;
+            }
+        }
+    }
+
+    fallback_slug.to_string()
+}
+
+fn copy_dir_contents(source: &Path, destination: &Path) -> Result<(), String> {
+    fs::create_dir_all(destination)
+        .map_err(|error| format!("创建目录 {} 失败：{}", destination.display(), error))?;
+
+    let entries = fs::read_dir(source)
+        .map_err(|error| format!("读取目录 {} 失败：{}", source.display(), error))?;
+
+    for entry in entries {
+        let entry = entry.map_err(|error| format!("读取目录条目失败：{}", error))?;
+        let source_path = entry.path();
+        let destination_path = destination.join(entry.file_name());
+
+        if source_path.is_dir() {
+            copy_dir_contents(&source_path, &destination_path)?;
+            continue;
+        }
+
+        fs::copy(&source_path, &destination_path).map_err(|error| {
+            format!(
+                "复制文件 {} 到 {} 失败：{}",
+                source_path.display(),
+                destination_path.display(),
+                error
+            )
+        })?;
+
+        if let Ok(metadata) = fs::metadata(&source_path) {
+            let _ = fs::set_permissions(&destination_path, metadata.permissions());
+        }
+    }
+
+    Ok(())
+}
+
+fn install_skill_directory(skill_root: &Path, install_dir_name: &str) -> Result<PathBuf, String> {
+    let skills_dir = clawhub_skills_dir();
+    fs::create_dir_all(&skills_dir)
+        .map_err(|error| format!("创建技能目录 {} 失败：{}", skills_dir.display(), error))?;
+
+    let staging_dir = skills_dir.join(format!(
+        ".{}-installing-{}-{}",
+        install_dir_name,
+        now_unix_ts(),
+        std::process::id()
+    ));
+    copy_dir_contents(skill_root, &staging_dir)?;
+
+    let final_dir = skills_dir.join(install_dir_name);
+    let backup_dir = if final_dir.exists() {
+        let path = skills_dir.join(format!(
+            ".{}-backup-{}-{}",
+            install_dir_name,
+            now_unix_ts(),
+            std::process::id()
+        ));
+        fs::rename(&final_dir, &path).map_err(|error| {
+            format!(
+                "准备替换旧技能目录 {} 失败：{}",
+                final_dir.display(),
+                error
+            )
+        })?;
+        Some(path)
+    } else {
+        None
+    };
+
+    match fs::rename(&staging_dir, &final_dir) {
+        Ok(()) => {
+            if let Some(path) = backup_dir {
+                let _ = fs::remove_dir_all(path);
+            }
+            Ok(final_dir)
+        }
+        Err(error) => {
+            if let Some(path) = backup_dir.as_ref() {
+                let _ = fs::rename(path, &final_dir);
+            }
+            let _ = fs::remove_dir_all(&staging_dir);
+            Err(format!("安装技能失败：{}", error))
+        }
+    }
+}
+
+fn install_clawhub_skill_zip_sync(
+    app: &AppHandle,
+    input: &str,
+) -> Result<ClawHubSkillInstallResult, String> {
+    emit_clawhub_skill_install_progress(app, 6, "正在识别技能来源...", None);
+    let resolved = resolve_clawhub_skill_source(input)?;
+    emit_clawhub_skill_install_progress(
+        app,
+        14,
+        format!("已识别技能：{}", resolved.slug),
+        Some(&resolved.slug),
+    );
+
+    let temp_root = std::env::temp_dir().join(format!(
+        "selfclaw-clawhub-{}-{}-{}",
+        resolved.slug,
+        now_unix_ts(),
+        std::process::id()
+    ));
+    let archive_path = temp_root.join("skill.zip");
+    let extracted_dir = temp_root.join("extracted");
+
+    let install_result = (|| -> Result<ClawHubSkillInstallResult, String> {
+        fs::create_dir_all(&temp_root)
+            .map_err(|error| format!("创建临时目录 {} 失败：{}", temp_root.display(), error))?;
+
+        emit_clawhub_skill_install_progress(
+            app,
+            18,
+            "正在获取技能压缩包...",
+            Some(&resolved.slug),
+        );
+        download_clawhub_skill_archive(app, &resolved.download_url, &archive_path, &resolved.slug)?;
+
+        emit_clawhub_skill_install_progress(app, 78, "下载完成，正在解压...", Some(&resolved.slug));
+        fs::create_dir_all(&extracted_dir)
+            .map_err(|error| format!("创建解压目录 {} 失败：{}", extracted_dir.display(), error))?;
+        extract_zip_archive(&archive_path, &extracted_dir)?;
+
+        emit_clawhub_skill_install_progress(
+            app,
+            88,
+            "正在校验技能内容...",
+            Some(&resolved.slug),
+        );
+        let skill_root = find_skill_root_dir(&extracted_dir)?;
+        let install_dir_name = derive_skill_install_dir_name(&skill_root, &resolved.slug);
+
+        emit_clawhub_skill_install_progress(
+            app,
+            94,
+            "正在安装到本机技能目录...",
+            Some(&install_dir_name),
+        );
+        let installed_dir = install_skill_directory(&skill_root, &install_dir_name)?;
+
+        emit_clawhub_skill_install_progress(
+            app,
+            100,
+            format!("安装完成：{}", install_dir_name),
+            Some(&install_dir_name),
+        );
+
+        Ok(ClawHubSkillInstallResult {
+            slug: install_dir_name,
+            installed_dir: installed_dir.to_string_lossy().to_string(),
+            source_url: resolved.source_url.clone(),
+            download_url: resolved.download_url.clone(),
+        })
+    })();
+
+    let _ = fs::remove_dir_all(&temp_root);
+    install_result
+}
+
+#[tauri::command]
+async fn install_clawhub_skill_zip(
+    app: AppHandle,
+    input: String,
+) -> Result<ClawHubSkillInstallResult, String> {
+    run_in_background(move || install_clawhub_skill_zip_sync(&app, &input)).await
+}
+
+#[tauri::command]
+async fn list_installed_clawhub_skills() -> Result<Vec<InstalledClawHubSkillMeta>, String> {
+    run_in_background(list_installed_clawhub_skills_sync).await
+}
+
+#[tauri::command]
+async fn check_clawhub_skill_updates(
+    inputs: Vec<ClawHubSkillUpdateCheckInput>,
+) -> Result<Vec<ClawHubSkillUpdateInfo>, String> {
+    run_in_background(move || check_clawhub_skill_updates_sync(inputs)).await
+}
+
 #[tauri::command]
 async fn download_file_with_progress(
     app: AppHandle,
@@ -2817,6 +3702,9 @@ fn main() {
             delete_im_channel,
             pair_im_channel,
             parse_dropped_file,
+            install_clawhub_skill_zip,
+            list_installed_clawhub_skills,
+            check_clawhub_skill_updates,
             download_file_with_progress,
             install_openclaw_cli
         ])

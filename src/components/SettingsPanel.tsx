@@ -2,31 +2,47 @@ import { useEffect, useMemo, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { AlertTriangle, RotateCcw, Save } from "lucide-react";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui";
-import { PROVIDERS, PROVIDER_MODELS } from "@/lib/models";
+import {
+  DEFAULT_MODEL,
+  DEFAULT_PROVIDER,
+  PROVIDERS,
+  getDefaultModelForProvider,
+  getProviderBaseUrl,
+  getProviderModels,
+  resolveBaseUrl,
+} from "@/lib/models";
 import { cn } from "@/lib/utils";
 import { useAppStore } from "@/store/appStore";
 
 type SettingsTab = "model" | "network" | "memory" | "advanced";
 type LogLevel = "info" | "debug" | "error";
 
+const DEFAULT_GATEWAY_PORT = 18789;
+const DEFAULT_MAX_TOKENS = 4096;
+const DEFAULT_HISTORY_LIMIT = 10;
+
 export function SettingsPanel() {
   const { openclaw, settings, setOpenClawConfig } = useAppStore();
 
   const [activeTab, setActiveTab] = useState<SettingsTab>("model");
-  const [provider, setProvider] = useState(openclaw.provider ?? "openai");
-  const [model, setModel] = useState(openclaw.model ?? "codex-mini-latest");
+  const [provider, setProvider] = useState(openclaw.provider ?? DEFAULT_PROVIDER);
+  const [model, setModel] = useState(openclaw.model ?? DEFAULT_MODEL);
   const [apiKey, setApiKey] = useState(openclaw.apiKey ?? "");
-  const [baseUrl, setBaseUrl] = useState(openclaw.baseUrl ?? "");
+  const [baseUrl, setBaseUrl] = useState(
+    resolveBaseUrl(openclaw.provider ?? DEFAULT_PROVIDER, openclaw.baseUrl)
+  );
   const [systemPrompt, setSystemPrompt] = useState(openclaw.systemPrompt ?? "");
   const [temperature, setTemperature] = useState(openclaw.temperature ?? 1);
-  const [maxTokens, setMaxTokens] = useState(openclaw.maxTokens ?? 4096);
+  const [maxTokens, setMaxTokens] = useState(openclaw.maxTokens ?? DEFAULT_MAX_TOKENS);
   const [httpProxy, setHttpProxy] = useState(openclaw.httpProxy ?? "");
   const [socks5Proxy, setSocks5Proxy] = useState(openclaw.socks5Proxy ?? "");
-  const [gatewayPort, setGatewayPort] = useState(openclaw.gatewayPort ?? 18789);
+  const [gatewayPort, setGatewayPort] = useState(
+    openclaw.gatewayPort ?? DEFAULT_GATEWAY_PORT
+  );
   const [gatewayToken, setGatewayToken] = useState(openclaw.gatewayToken ?? "");
   const [logLevel, setLogLevel] = useState<LogLevel>(openclaw.logLevel ?? "info");
   const [historyMessageLimit, setHistoryMessageLimit] = useState(
-    openclaw.historyMessageLimit ?? 10
+    openclaw.historyMessageLimit ?? DEFAULT_HISTORY_LIMIT
   );
   const [longTermMemoryEnabled, setLongTermMemoryEnabled] = useState(
     openclaw.longTermMemoryEnabled ?? false
@@ -40,22 +56,24 @@ export function SettingsPanel() {
   const [showResetModal, setShowResetModal] = useState(false);
   const [status, setStatus] = useState("");
 
-  const availableModels = useMemo(() => PROVIDER_MODELS[provider] ?? [], [provider]);
+  const availableModels = useMemo(() => getProviderModels(provider), [provider]);
 
   useEffect(() => {
-    setProvider(openclaw.provider ?? "openai");
-    setModel(openclaw.model ?? "codex-mini-latest");
+    const nextProvider = openclaw.provider ?? DEFAULT_PROVIDER;
+
+    setProvider(nextProvider);
+    setModel(openclaw.model ?? getDefaultModelForProvider(nextProvider));
     setApiKey(openclaw.apiKey ?? "");
-    setBaseUrl(openclaw.baseUrl ?? "");
+    setBaseUrl(resolveBaseUrl(nextProvider, openclaw.baseUrl));
     setSystemPrompt(openclaw.systemPrompt ?? "");
     setTemperature(openclaw.temperature ?? 1);
-    setMaxTokens(openclaw.maxTokens ?? 4096);
+    setMaxTokens(openclaw.maxTokens ?? DEFAULT_MAX_TOKENS);
     setHttpProxy(openclaw.httpProxy ?? "");
     setSocks5Proxy(openclaw.socks5Proxy ?? "");
-    setGatewayPort(openclaw.gatewayPort ?? 18789);
+    setGatewayPort(openclaw.gatewayPort ?? DEFAULT_GATEWAY_PORT);
     setGatewayToken(openclaw.gatewayToken ?? "");
     setLogLevel(openclaw.logLevel ?? "info");
-    setHistoryMessageLimit(openclaw.historyMessageLimit ?? 10);
+    setHistoryMessageLimit(openclaw.historyMessageLimit ?? DEFAULT_HISTORY_LIMIT);
     setLongTermMemoryEnabled(openclaw.longTermMemoryEnabled ?? false);
     setAutostartEnabled(openclaw.autostartEnabled ?? false);
   }, [openclaw]);
@@ -68,11 +86,12 @@ export function SettingsPanel() {
         if (!isMounted) {
           return;
         }
+
         setAutostartEnabled(enabled);
         setOpenClawConfig({ autostartEnabled: enabled });
       })
       .catch(() => {
-        // 非 Windows 或权限不足时保持当前状态
+        // Ignore unsupported platforms or permission issues.
       });
 
     return () => {
@@ -93,7 +112,7 @@ export function SettingsPanel() {
     );
 
     const trimmedApiKey = apiKey.trim();
-    const trimmedBaseUrl = baseUrl.trim();
+    const trimmedBaseUrl = resolveBaseUrl(provider, baseUrl);
     const trimmedSystemPrompt = systemPrompt.trim();
     const trimmedHttpProxy = httpProxy.trim();
     const trimmedSocks5Proxy = socks5Proxy.trim();
@@ -119,14 +138,13 @@ export function SettingsPanel() {
     } as const;
 
     setSaveWorking(true);
+
     try {
-      const result = await new Promise<string>(async (resolve, reject) => {
-        const timer = window.setTimeout(
-          () => reject(new Error("保存超时（10s），请重试")),
-          10000
-        );
-        try {
-          const result = await invoke<string>("update_openclaw_config", {
+      let timeoutId: number | undefined;
+
+      try {
+        await Promise.race([
+          invoke<string>("update_openclaw_config", {
             payload: {
               provider,
               model,
@@ -147,18 +165,22 @@ export function SettingsPanel() {
               customName: trimmedCustomName,
               theme: settings.theme,
             },
-          });
-          clearTimeout(timer);
-          resolve(result);
-        } catch (error) {
-          clearTimeout(timer);
-          reject(error);
+          }),
+          new Promise<never>((_, reject) => {
+            timeoutId = window.setTimeout(() => {
+              reject(new Error("保存超时（10s），请重试"));
+            }, 10000);
+          }),
+        ]);
+      } finally {
+        if (timeoutId !== undefined) {
+          window.clearTimeout(timeoutId);
         }
-      });
+      }
 
       setOpenClawConfig(nextConfig);
       setStatus(
-        "设置已保存：底层配置已写入 ~/.openclaw/openclaw.json，UI 偏好已写入 ~/.openclaw/selfclaw-ui.json"
+        "设置已保存：底层配置写入 ~/.openclaw/openclaw.json，UI 偏好写入 ~/.openclaw/selfclaw-ui.json"
       );
     } catch (error) {
       setStatus(`设置保存失败：${String(error)}`);
@@ -169,6 +191,7 @@ export function SettingsPanel() {
 
   const toggleAutostart = async () => {
     const next = !autostartEnabled;
+
     setAutostartWorking(true);
     try {
       const enabled = await invoke<boolean>("set_autostart_enabled", { enabled: next });
@@ -184,6 +207,7 @@ export function SettingsPanel() {
 
   const confirmResetClient = async () => {
     setResetWorking(true);
+
     try {
       await useAppStore.persist.clearStorage();
       window.localStorage.clear();
@@ -215,6 +239,7 @@ export function SettingsPanel() {
             按模块管理模型、网络、记忆与系统级行为。
           </p>
         </div>
+
         <button
           type="button"
           onClick={() => void save()}
@@ -254,7 +279,7 @@ export function SettingsPanel() {
             data-active={activeTab === "advanced"}
             className="rounded-lg bg-neutral-900 px-3 py-2 text-sm text-neutral-300 data-[active=true]:bg-orange-500/20 data-[active=true]:text-orange-300"
           >
-            高级与危险操作
+            高级与风险操作
           </TabsTrigger>
         </TabsList>
 
@@ -267,12 +292,10 @@ export function SettingsPanel() {
               <select
                 value={provider}
                 onChange={(event) => {
-                  const next = event.target.value;
-                  setProvider(next);
-                  const fallbackModel = PROVIDER_MODELS[next]?.[0]?.id;
-                  if (fallbackModel) {
-                    setModel(fallbackModel);
-                  }
+                  const nextProvider = event.target.value;
+                  setProvider(nextProvider);
+                  setModel(getDefaultModelForProvider(nextProvider));
+                  setBaseUrl(getProviderBaseUrl(nextProvider));
                 }}
                 className="h-10 w-full rounded-lg border border-neutral-700 bg-neutral-900 px-3 text-sm text-neutral-100 outline-none ring-orange-500 focus:ring-2"
               >
@@ -288,7 +311,10 @@ export function SettingsPanel() {
               <label className="text-xs uppercase tracking-wide text-neutral-400">模型</label>
               <select
                 value={model}
-                onChange={(event) => setModel(event.target.value)}
+                onChange={(event) => {
+                  setModel(event.target.value);
+                  setBaseUrl((current) => current.trim() || getProviderBaseUrl(provider));
+                }}
                 className="h-10 w-full rounded-lg border border-neutral-700 bg-neutral-900 px-3 text-sm text-neutral-100 outline-none ring-orange-500 focus:ring-2"
               >
                 {availableModels.map((item) => (
@@ -315,9 +341,12 @@ export function SettingsPanel() {
               <input
                 value={baseUrl}
                 onChange={(event) => setBaseUrl(event.target.value)}
-                placeholder="https://api.openai.com/v1"
+                placeholder={getProviderBaseUrl(provider)}
                 className="h-10 w-full rounded-lg border border-neutral-700 bg-neutral-900 px-3 text-sm text-neutral-100 outline-none ring-orange-500 focus:ring-2"
               />
+              <p className="text-xs text-neutral-500">
+                切换提供商时会自动填充默认地址，仍可手动覆盖。
+              </p>
             </div>
 
             <div className="space-y-2 sm:col-span-2">
@@ -335,7 +364,7 @@ export function SettingsPanel() {
 
             <div className="space-y-2">
               <label className="text-xs uppercase tracking-wide text-neutral-400">
-                Temperature：{temperature.toFixed(1)}
+                Temperature: {temperature.toFixed(1)}
               </label>
               <input
                 type="range"
@@ -349,7 +378,9 @@ export function SettingsPanel() {
             </div>
 
             <div className="space-y-2">
-              <label className="text-xs uppercase tracking-wide text-neutral-400">Max Tokens</label>
+              <label className="text-xs uppercase tracking-wide text-neutral-400">
+                Max Tokens
+              </label>
               <input
                 type="number"
                 min={1}
@@ -364,7 +395,9 @@ export function SettingsPanel() {
         <TabsContent value="network" className="mt-4">
           <div className="grid gap-4 rounded-xl border border-neutral-800 bg-neutral-800 p-5 sm:grid-cols-2">
             <div className="space-y-2 sm:col-span-2">
-              <label className="text-xs uppercase tracking-wide text-neutral-400">HTTP 代理</label>
+              <label className="text-xs uppercase tracking-wide text-neutral-400">
+                HTTP 代理
+              </label>
               <input
                 value={httpProxy}
                 onChange={(event) => setHttpProxy(event.target.value)}
@@ -374,7 +407,9 @@ export function SettingsPanel() {
             </div>
 
             <div className="space-y-2 sm:col-span-2">
-              <label className="text-xs uppercase tracking-wide text-neutral-400">SOCKS5 代理</label>
+              <label className="text-xs uppercase tracking-wide text-neutral-400">
+                SOCKS5 代理
+              </label>
               <input
                 value={socks5Proxy}
                 onChange={(event) => setSocks5Proxy(event.target.value)}
@@ -398,7 +433,9 @@ export function SettingsPanel() {
             </div>
 
             <div className="space-y-2">
-              <label className="text-xs uppercase tracking-wide text-neutral-400">日志级别</label>
+              <label className="text-xs uppercase tracking-wide text-neutral-400">
+                日志级别
+              </label>
               <select
                 value={logLevel}
                 onChange={(event) => setLogLevel(event.target.value as LogLevel)}
@@ -411,15 +448,20 @@ export function SettingsPanel() {
             </div>
 
             <div className="space-y-2 sm:col-span-2">
-              <label className="text-xs uppercase tracking-wide text-neutral-400">网关认证 Token</label>
+              <label className="text-xs uppercase tracking-wide text-neutral-400">
+                网关认证 Token
+              </label>
               <input
                 type="password"
                 value={gatewayToken}
                 onChange={(event) => setGatewayToken(event.target.value)}
-                placeholder="留空则自动使用 API Key"
+                placeholder="留空则优先使用 API Key"
                 className="h-10 w-full rounded-lg border border-neutral-700 bg-neutral-900 px-3 text-sm text-neutral-100 outline-none ring-orange-500 focus:ring-2"
               />
-              <p className="text-xs text-neutral-500">用于 WebSocket 认证，可从 ~/.openclaw/openclaw.json 中 gateway.auth.token 字段获取</p>
+              <p className="text-xs text-neutral-500">
+                用于 WebSocket 认证，可从 ~/.openclaw/openclaw.json 的
+                gateway.auth.token 获取。
+              </p>
             </div>
           </div>
         </TabsContent>
@@ -443,7 +485,7 @@ export function SettingsPanel() {
               <div>
                 <p className="text-sm font-medium text-neutral-100">长期记忆</p>
                 <p className="text-xs text-neutral-400">
-                  开启后将对话写入本地向量或 SQLite 存储。
+                  开启后会把对话写入本地向量库或 SQLite 存储。
                 </p>
               </div>
               <button
@@ -467,7 +509,9 @@ export function SettingsPanel() {
             <div className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-neutral-700 bg-neutral-900 p-3">
               <div>
                 <p className="text-sm font-medium text-neutral-100">开机自启</p>
-                <p className="text-xs text-neutral-400">启动系统后自动拉起 SelfClaw 客户端。</p>
+                <p className="text-xs text-neutral-400">
+                  系统启动后自动拉起 SelfClaw 客户端。
+                </p>
               </div>
               <button
                 type="button"
@@ -480,7 +524,11 @@ export function SettingsPanel() {
                     : "bg-neutral-700 text-neutral-200 hover:bg-neutral-600"
                 )}
               >
-                {autostartWorking ? "处理中..." : autostartEnabled ? "已开启" : "已关闭"}
+                {autostartWorking
+                  ? "处理中..."
+                  : autostartEnabled
+                    ? "已开启"
+                    : "已关闭"}
               </button>
             </div>
           </div>
@@ -491,8 +539,8 @@ export function SettingsPanel() {
               <h3 className="font-semibold">重置 SelfClaw</h3>
             </div>
             <p className="mb-4 text-sm text-red-200/80">
-              该操作会清除当前控制台的所有本地配置并恢复初始状态，不会影响底层
-              OpenClaw 工作区数据。
+              这会清除当前客户端的本地配置并恢复初始状态，不会删除底层 OpenClaw
+              工作区数据。
             </p>
             <button
               type="button"
@@ -514,7 +562,7 @@ export function SettingsPanel() {
           <div className="w-full max-w-md rounded-2xl border border-neutral-700 bg-neutral-900 p-5 shadow-2xl">
             <h4 className="text-lg font-semibold text-neutral-100">重置 SelfClaw</h4>
             <p className="mt-2 text-sm text-neutral-300">
-              该操作会清除当前控制台的本地配置，不会影响底层 OpenClaw 工作区数据。
+              这会清除当前客户端的本地配置，不会影响底层 OpenClaw 工作区数据。
             </p>
             <div className="mt-5 flex justify-end gap-2">
               <button
